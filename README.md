@@ -1,12 +1,7 @@
 # Lua Neural Network for Word-to-Character Sequence Prediction
 
-**Your Name**
 
-**Date:** Today's Date
 
-## Abstract
-
-This paper provides an in-depth analysis of a Lua-based neural network designed for predicting character sequences from word sequences. We explore the network's architecture, implementation details, and the underlying mathematical principles. We also discuss potential applications and propose several enhancements to improve its performance and robustness.
 
 ## Introduction
 
