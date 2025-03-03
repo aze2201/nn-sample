@@ -1,0 +1,42 @@
+graph TD
+    A[Load Data dataset.csv] --> B{Build Vocabularies};
+    B --> C{Dynamic Input/Output Sizes};
+    C --> D[Initialize Weights];
+    D --> E[Training Loop];
+    E --> F{Forward Propagation};
+    F --> G{Calculate Error};
+    G --> H{Check Prediction};
+    H --> I{Backpropagation};
+    I --> J{Update Weights Gradient Clipping};
+    J --> E;
+    E --> K{Save Model model.lua};
+    K --> L[Prediction Input 3 Words];
+    L --> M{Input to Vector};
+    M --> N{Forward Propagation};
+    N --> O{Output to Prediction};
+    O --> P[Predicted Characters];
+
+    subgraph "Training Process"
+        A; B; C; D; E; F; G; H; I; J; K;
+    end
+
+    subgraph "Prediction Process"
+        L; M; N; O; P;
+    end
+
+    style A fill:#ccf,stroke:#333,stroke-width:2px;
+    style B fill:#ccf,stroke:#333,stroke-width:2px;
+    style C fill:#ccf,stroke:#333,stroke-width:2px;
+    style D fill:#ccf,stroke:#333,stroke-width:2px;
+    style E fill:#cfc,stroke:#333,stroke-width:2px;
+    style F fill:#cfc,stroke:#333,stroke-width:2px;
+    style G fill:#efe,stroke:#333,stroke-width:2px;
+    style H fill:#efe,stroke:#333,stroke-width:2px;
+    style I fill:#efe,stroke:#333,stroke-width:2px;
+    style J fill:#cfc,stroke:#333,stroke-width:2px;
+    style K fill:#cfc,stroke:#333,stroke-width:2px;
+    style L fill:#f9f,stroke:#333,stroke-width:2px;
+    style M fill:#ccf,stroke:#333,stroke-width:2px;
+    style N fill:#cfc,stroke:#333,stroke-width:2px;
+    style O fill:#efe,stroke:#333,stroke-width:2px;
+    style P fill:#cfc,stroke:#333,stroke-width:2px;
