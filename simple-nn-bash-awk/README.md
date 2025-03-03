@@ -8,7 +8,7 @@ The script begins by building vocabularies for words and characters from a datas
 
 ### Word and Character Counting:
 
-It reads each line from the dataset, splits it into words (`w1`, `w2`, `w3`) and a target string (`target`). It then counts the occurrences of each word and character using associative arrays `word_counts` and `char_counts`.
+It reads each line from the dataset, splits it into words `(`w1`, `w2`, `w3`)` and a target string (`target`). It then counts the occurrences of each word and character using associative arrays `word_counts` and `char_counts`.
 
 ### Vocabulary Files:
 
@@ -36,53 +36,56 @@ Each input word is converted to a one-hot encoded vector. The target string is a
 
 The input vector is multiplied by the first weight matrix (`W1`), and a sigmoid activation function is applied:
 
+```
 hidden[j] = 1 / (1 + e^(-Σ(input[i] * W1[i,j])))
-
+```
 
 ##### Output Layer Calculation:
 
 The hidden layer output is multiplied by the second weight matrix (`W2`):
-
+```
 output[k] = Σ(hidden[j] * W2[j,k])
+```
 
 
 ##### Softmax Function:
 
 The output is passed through a softmax function to obtain probabilities:
-
+```
 probs[k] = e^(output[k]) / Σ e^(output[k])
+```
 
 
 #### Error Calculation:
 
 The error is computed as the mean squared error between the predicted probabilities and the target values:
-
+```
 error = (1 / OUTPUT_SIZE) * Σ (probs[k] - target[k])^2
-
+```
 
 #### Backpropagation:
 
 ##### Output Layer Delta:
-
+```
 δ3[k] = probs[k] - target[k]
-
+```
 
 ##### Hidden Layer Delta:
-
+```
 δ2[j] = (Σ(δ3[k] * W2[j,k])) * hidden[j] * (1 - hidden[j])
-
+```
 
 #### Weight Updates:
 
 ##### Second Layer Weights:
-
+```
 W2[j,k] = W2[j,k] - LEARNING_RATE * δ3[k] * hidden[j]
-
+```
 
 ##### First Layer Weights:
-
+```
 W1[i,j] = W1[i,j] - LEARNING_RATE * δ2[j] * input[i]
-
+```
 
 #### Metrics Calculation:
 
