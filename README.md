@@ -1,4 +1,4 @@
-# Detailed Analysis of a Lua Neural Network for Word-to-Character Sequence Prediction
+# Lua Neural Network for Word-to-Character Sequence Prediction
 
 **Your Name**
 
