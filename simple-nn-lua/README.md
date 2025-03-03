@@ -22,7 +22,8 @@ The network comprises three layers: an input layer, a hidden layer, and an outpu
 * **Hidden Layer:** The size is a configurable parameter, `HIDDEN_SIZE`. The sigmoid activation function is applied.
 * **Output Layer:** The size is determined by `3 * |Vc|`, where `|Vc|` is the size of the character vocabulary. The softmax function is applied to character groups.
 
-![Neural Network Flow](flowdiagram.svg)
+
+<img src="flowdiagram.svg" width="480">
 
 ### Mathematical Foundations
 
