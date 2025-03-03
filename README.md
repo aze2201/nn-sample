@@ -15,13 +15,14 @@ The `load_data()` function reads a CSV file, "dataset.csv," where each line is s
 
 ### Neural Network Architecture
 
+![Neural Network Architecture](nn-l.png)
 The network comprises three layers: an input layer, a hidden layer, and an output layer.
 
 * **Input Layer:** The size is determined by `3 * |Vw|`, where `|Vw|` is the size of the word vocabulary. Each input word is encoded as a one-hot vector.
 * **Hidden Layer:** The size is a configurable parameter, `HIDDEN_SIZE`. The sigmoid activation function is applied.
 * **Output Layer:** The size is determined by `3 * |Vc|`, where `|Vc|` is the size of the character vocabulary. The softmax function is applied to character groups.
 
-![Neural Network Architecture](flowdiagram.svg)
+![Neural Network Flow](flowdiagram.svg)
 
 ### Mathematical Foundations
 
