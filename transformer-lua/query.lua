@@ -387,23 +387,30 @@ end
 -- Main execution
 load_model()
 
-print("Enter your question (press Ctrl+D when done):")
-local question = "Who is"
-log(string.format("Raw input received: %q", question))
 
-if #question == 0 then
-    error("No input provided! Did you press Ctrl+D correctly?")
+while true do
+
+   print("Enter your question (press Ctrl+D when done):")
+   --local question = "Who is Fariz"
+   io.write("> ")
+   io.flush()
+   local question = io.read()
+   log(string.format("Raw input received: %q", question))
+
+   if #question == 0 then
+       error("No input provided! Did you press Ctrl+D correctly?")
+   end
+
+   local input_tokens = tokenize(question)
+   log(string.format("Tokenized input (%d tokens):", #input_tokens))
+   log(table.concat(input_tokens, ", "))
+
+   -- Only capture the generated tokens
+   local output_tokens = generate(input_tokens, 100, 0.7)
+   local response = detokenize(output_tokens)
+
+   print("\n=== Final Response ===")
+   print(response)
 end
-
-local input_tokens = tokenize(question)
-log(string.format("Tokenized input (%d tokens):", #input_tokens))
-log(table.concat(input_tokens, ", "))
-
--- Only capture the generated tokens
-local output_tokens = generate(input_tokens, 100, 0.7)
-local response = detokenize(output_tokens)
-
-print("\n=== Final Response ===")
-print(response)
 
 db:close()
