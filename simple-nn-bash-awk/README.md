@@ -8,7 +8,7 @@ The script begins by building vocabularies for words and characters from a datas
 
 ### Word and Character Counting:
 
-It reads each line from the dataset, splits it into words `(`w1`, `w2`, `w3`)` and a target string (`target`). It then counts the occurrences of each word and character using associative arrays `word_counts` and `char_counts`.
+It reads each line from the dataset, splits it into words (`w1`, `w2`, `w3`) and a target string (`target`). It then counts the occurrences of each word and character using associative arrays `word_counts` and `char_counts`.
 
 ### Vocabulary Files:
 
