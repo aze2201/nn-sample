@@ -1,4 +1,4 @@
-# Bash Script: Neural Network with AWK
+# Bash Script: Neural Network FFN with AWK
 
 This Bash script implements a simple neural network using AWK for data processing and training. Below is a detailed breakdown of its components, including steps, formulas, and code flow.
 
