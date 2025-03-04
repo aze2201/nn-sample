@@ -268,3 +268,52 @@ This Lua script is a self-contained demonstration of how to build a transformer-
 
 The design and structure are modular enough to serve as a learning tool, a base for experimentation in language modeling, or even a prototype for extending to other domains.
 
+```
+          Input: Embedded Tokens [L x E]
+                     |
+               +-----v-----+
+               | Layer Norm|  (applied to each token)
+               +-----+-----+
+                     |
+       +-------------v-------------+
+       |  Multi-Head Self-Attention|
+       +-------------+-------------+
+                     |
+           For each Head (h = 1...H):
+                     |
+      +--------------------------------------+
+      | Split embedding into H heads       |
+      | Head Dimension: head_dim = E / H     |
+      |                                      |
+      | For each token i, compute:           |
+      |   Q_i = X_i · W_q    (size: head_dim)|
+      |   K_i = X_i · W_k    (size: head_dim)|
+      |   V_i = X_i · W_v    (size: head_dim)|
+      +----------------+---------------------+
+                     |
+         Compute Attention per head:
+                     |
+       +-------------v-------------+
+       |   Scaled Dot-Product       |
+       |  Attention Formula:        |
+       |                            |
+       |  Attention(Q, K, V) =      |
+       |  softmax( QKᵀ / √dₖ )V     |
+       |                            |
+       +-------------+-------------+
+                     |
+      +--------------v--------------+
+      | Concatenate outputs of all  |
+      | heads back into a single    |
+      | vector of dimension E       |
+      +--------------+--------------+
+                     |
+            +--------v--------+
+            | Linear Projection|
+            |  (W_proj: E x E) |
+            +--------+--------+
+                     |
+          Dropout (optional)
+
+```
+
