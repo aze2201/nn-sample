@@ -10,14 +10,14 @@ ffi.cdef[[
 
 -- Configuration
 local cfg = {
-    vocab_size = 426,
+    vocab_size = 4189,
     embed_dim = 128,
     num_heads = 8,        -- must divide embed_dim evenly
     num_layers = 6,
-    seq_len = 256,
+    seq_len = 128,
     lr = 3e-4,
-    batch_size = 32,
-    max_iters = 1,     -- increased for actual training
+    batch_size = 16,
+    max_iters = 3,     -- increased for actual training
     dropout = 0.2,
     model_db = 'gpt_model.db',
     beta1 = 0.9,
@@ -86,9 +86,12 @@ local GPT = {}
 local vocab = {}
 local idx_to_word = {}
 
--- Utility: Simple Layer Normalization (no learnable parameters)
-local function layer_norm(vec, size, eps)
-    print("layer normalization function ....")
+--------------------------------------------------
+-- Utility functions for forward and backward ops
+--------------------------------------------------
+
+-- Layer normalization forward returns normalized vector and cache
+local function layer_norm_forward(vec, size, eps)
     eps = eps or 1e-5
     local sum = 0
     for i = 0, size - 1 do
@@ -105,23 +108,719 @@ local function layer_norm(vec, size, eps)
     for i = 0, size - 1 do
         norm[i] = (vec[i] - mean) / math.sqrt(variance + eps)
     end
-    return norm
+    local cache = {mean = mean, variance = variance, size = size, eps = eps, vec = vec}
+    return norm, cache
 end
 
--- Utility: Dropout (applied elementwise)
-local function dropout(vec, size, dropout_rate)
+-- A simplified layer_norm backward (computing dvec given dnorm)
+local function layer_norm_backward(dnorm, cache)
+    local size = cache.size
+    local x = cache.vec
+    local mean = cache.mean
+    local var = cache.variance
+    local eps = cache.eps
+    local std = math.sqrt(var + eps)
+    local dvec = ffi.new("double[?]", size)
+    local dmean = 0
+    local dvar = 0
+    for i = 0, size - 1 do
+        dvar = dvar + dnorm[i] * (x[i] - mean) * -0.5 * (var + eps)^(-1.5)
+    end
+    for i = 0, size - 1 do
+        dmean = dmean + dnorm[i] * -1 / std
+    end
+    for i = 0, size - 1 do
+        dvec[i] = dnorm[i] / std + dvar * 2 * (x[i] - mean) / size + dmean / size
+    end
+    return dvec
+end
+
+-- Dropout forward returns output and a mask
+local function dropout_forward(vec, size, dropout_rate)
     local out = ffi.new("double[?]", size)
+    local mask = {}
     for i = 0, size - 1 do
         if math.random() < dropout_rate then
             out[i] = 0
+            mask[i] = 0
         else
             out[i] = vec[i]
+            mask[i] = 1
         end
     end
-    return out
+    return out, mask
 end
 
--- Vocabulary building remains the same
+-- Dropout backward: multiply gradient by mask
+local function dropout_backward(dout, mask, size)
+    local dvec = ffi.new("double[?]", size)
+    for i = 0, size - 1 do
+        dvec[i] = dout[i] * mask[i]
+    end
+    return dvec
+end
+
+-- Linear forward: computes output = input * tensor
+local function linear_forward(input, tensor)
+    local in_features = tensor.rows
+    local out_features = tensor.cols
+    local output = ffi.new("double[?]", out_features)
+    for j = 1, out_features do
+        local sum = 0
+        for i = 1, in_features do
+            sum = sum + input[i-1] * tensor:get(i, j)
+        end
+        output[j-1] = sum
+    end
+    return output
+end
+
+-- Linear backward: compute gradients for tensor and propagate gradient to input
+local function linear_backward(input, doutput, tensor, grad_tensor)
+    local in_features = tensor.rows
+    local out_features = tensor.cols
+    local dinput = ffi.new("double[?]", in_features)
+    for i = 0, in_features-1 do dinput[i] = 0 end
+    for i = 1, in_features do
+        for j = 1, out_features do
+            grad_tensor[(i-1)*out_features + (j-1)] = grad_tensor[(i-1)*out_features + (j-1)] + input[i-1] * doutput[j-1]
+            dinput[i-1] = dinput[i-1] + tensor:get(i, j) * doutput[j-1]
+        end
+    end
+    return dinput
+end
+
+-- ReLU forward returns output and a mask of activated units
+local function relu_forward(input, size)
+    local out = ffi.new("double[?]", size)
+    local mask = {}
+    for i = 0, size - 1 do
+        if input[i] > 0 then
+            out[i] = input[i]
+            mask[i] = 1
+        else
+            out[i] = 0
+            mask[i] = 0
+        end
+    end
+    return out, mask
+end
+
+-- ReLU backward: multiply gradient by mask
+local function relu_backward(dout, mask, size)
+    local dinput = ffi.new("double[?]", size)
+    for i = 0, size-1 do
+        dinput[i] = dout[i] * mask[i]
+    end
+    return dinput
+end
+
+--------------------------------------------------
+-- Tensor creation helper
+--------------------------------------------------
+local function create_tensor(rows, cols)
+    local size = rows * cols
+    local data = ffi.new("double[?]", size)
+    local grad = ffi.new("double[?]", size)
+    local m = ffi.new("double[?]", size)  -- First moment
+    local v = ffi.new("double[?]", size)  -- Second moment
+    ffi.fill(data, ffi.sizeof("double") * size, 0)
+    ffi.fill(grad, ffi.sizeof("double") * size, 0)
+    ffi.fill(m, ffi.sizeof("double") * size, 0)
+    ffi.fill(v, ffi.sizeof("double") * size, 0)
+    return {
+        data = data,
+        grad = grad,
+        m = m,
+        v = v,
+        rows = rows,
+        cols = cols,
+        get = function(self, i, j)
+            return self.data[(i-1)*self.cols + (j-1)]
+        end,
+        set = function(self, i, j, val)
+            self.data[(i-1)*self.cols + (j-1)] = val
+        end,
+        add_grad = function(self, i, j, val)
+            self.grad[(i-1)*self.cols + (j-1)] = self.grad[(i-1)*self.cols + (j-1)] + val
+        end,
+        zero_grad = function(self)
+            ffi.fill(self.grad, ffi.sizeof("double") * self.rows * self.cols, 0)
+        end
+    }
+end
+
+--------------------------------------------------
+-- Transformer block constructor (initializes parameters)
+--------------------------------------------------
+local function transformer_block()
+    -- Attention components
+    local attn = {
+        q = create_tensor(cfg.embed_dim, cfg.embed_dim),
+        k = create_tensor(cfg.embed_dim, cfg.embed_dim),
+        v = create_tensor(cfg.embed_dim, cfg.embed_dim),
+        proj = create_tensor(cfg.embed_dim, cfg.embed_dim)
+    }
+    
+    -- MLP components
+    local mlp = {
+        fc1 = create_tensor(cfg.embed_dim, 4 * cfg.embed_dim),
+        fc2 = create_tensor(4 * cfg.embed_dim, cfg.embed_dim)
+    }
+
+    -- Initialize attention weights with Xavier initialization
+    local sqrt_k = math.sqrt(1.0 / cfg.embed_dim)
+    for _, component in pairs(attn) do
+        for i = 1, component.rows do
+            for j = 1, component.cols do
+                component:set(i, j, (math.random() - 0.5) * sqrt_k)
+            end
+        end
+    end
+
+    -- Initialize MLP weights with He initialization
+    for _, component in pairs(mlp) do
+        local fan_in = component.rows
+        local bound = math.sqrt(3.0 / fan_in)
+        for i = 1, component.rows do
+            for j = 1, component.cols do
+                component:set(i, j, (math.random() - 0.5) * 2 * bound)
+            end
+        end
+    end
+
+    return {
+        attn = attn,
+        mlp = mlp  -- Ensure MLP is included in the returned block
+    }
+end
+
+--------------------------------------------------
+-- Transformer block forward with causal masking and cache for backprop
+--------------------------------------------------
+local function transformer_block_forward(block, norm_tokens)
+    local head_dim = cfg.embed_dim / cfg.num_heads
+    local seq_len = #norm_tokens
+    local cache = {}
+    cache.attention = {}
+    cache.attention.heads = {} -- will store per-token per-head caches
+    local attn_outputs = {}
+    for t = 1, seq_len do
+        attn_outputs[t] = ffi.new("double[?]", cfg.embed_dim)
+        for d = 0, cfg.embed_dim-1 do attn_outputs[t][d] = 0 end
+        cache.attention.heads[t] = {}
+    end
+    for h = 1, cfg.num_heads do
+        for i = 1, seq_len do
+            local head_cache = {}
+            -- Compute query for token i for head h
+            local q = ffi.new("double[?]", head_dim)
+            for d = 1, head_dim do
+                q[d-1] = 0
+                for j = 1, cfg.embed_dim do
+                    q[d-1] = q[d-1] + norm_tokens[i][j-1] * block.attn.q:get(j, (h-1)*head_dim + d)
+                end
+            end
+            head_cache.q = q
+            -- Compute keys and values for all tokens
+            local keys = {}
+            local values = {}
+            for j = 1, seq_len do
+                local k = ffi.new("double[?]", head_dim)
+                local v = ffi.new("double[?]", head_dim)
+                for d = 1, head_dim do
+                    k[d-1] = 0
+                    v[d-1] = 0
+                    for r = 1, cfg.embed_dim do
+                        k[d-1] = k[d-1] + norm_tokens[j][r-1] * block.attn.k:get(r, (h-1)*head_dim + d)
+                        v[d-1] = v[d-1] + norm_tokens[j][r-1] * block.attn.v:get(r, (h-1)*head_dim + d)
+                    end
+                end
+                keys[j] = k
+                values[j] = v
+            end
+            head_cache.keys = keys
+            head_cache.values = values
+            -- Compute attention scores with causal masking:
+            local scores = ffi.new("double[?]", seq_len)
+            local max_score = -math.huge
+            for j = 1, seq_len do
+                local score = 0
+                if j <= i then
+                    for d = 0, head_dim-1 do
+                        score = score + q[d] * keys[j][d]
+                    end
+                    score = score / math.sqrt(head_dim)
+                else
+                    score = -math.huge
+                end
+                scores[j-1] = score
+                if score > max_score then max_score = score end
+            end
+            head_cache.scores = scores
+            head_cache.max_score = max_score
+            local exps = ffi.new("double[?]", seq_len)
+            local sum_exp = 0
+            for j = 1, seq_len do
+                if scores[j-1] == -math.huge then
+                    exps[j-1] = 0
+                else
+                    exps[j-1] = math.exp(scores[j-1] - max_score)
+                end
+                sum_exp = sum_exp + exps[j-1]
+            end
+            head_cache.exps = exps
+            head_cache.sum_exp = sum_exp
+            local attn_weights = ffi.new("double[?]", seq_len)
+            for j = 1, seq_len do
+                attn_weights[j-1] = exps[j-1] / sum_exp
+            end
+            head_cache.attn_weights = attn_weights
+            local head_output = ffi.new("double[?]", head_dim)
+            for d = 0, head_dim-1 do head_output[d] = 0 end
+            for j = 1, seq_len do
+                local weight = attn_weights[j-1]
+                for d = 0, head_dim-1 do
+                    head_output[d] = head_output[d] + weight * values[j][d]
+                end
+            end
+            head_cache.head_output = head_output
+            for d = 0, head_dim-1 do
+                attn_outputs[i][(h-1)*head_dim + d] = attn_outputs[i][(h-1)*head_dim + d] + head_output[d]
+            end
+            cache.attention.heads[i][h] = head_cache
+        end
+    end
+    -- Apply projection of attention outputs
+    cache.attention.proj = {}
+    local proj_outputs = {}
+    for t = 1, seq_len do
+        proj_outputs[t] = ffi.new("double[?]", cfg.embed_dim)
+        local proj_cache = {input = attn_outputs[t]}
+        for d = 1, cfg.embed_dim do
+            local sum = 0
+            for i = 1, cfg.embed_dim do
+                sum = sum + attn_outputs[t][i-1] * block.attn.proj:get(i, d)
+            end
+            proj_outputs[t][d-1] = sum
+        end
+        local dropped, dropout_mask = dropout_forward(proj_outputs[t], cfg.embed_dim, cfg.dropout)
+        proj_outputs[t] = dropped
+        proj_cache.dropout_mask = dropout_mask
+        cache.attention.proj[t] = proj_cache
+    end
+    -- First residual connection: add projection output to the (non-normalized) input.
+    cache.attention.res1 = {}
+    local res1 = {}
+    for t = 1, seq_len do
+        res1[t] = ffi.new("double[?]", cfg.embed_dim)
+        for d = 0, cfg.embed_dim-1 do
+            res1[t][d] = norm_tokens[t][d] + proj_outputs[t][d]
+        end
+        cache.attention.res1[t] = res1[t]
+    end
+    -- Second sub-layer: MLP branch.
+    cache.mlp = {}
+    cache.mlp.fc1 = {}
+    cache.mlp.fc2 = {}
+    cache.mlp.relu_mask = {}
+    local mlp_outputs = {}
+    for t = 1, seq_len do
+        local norm_res1, norm_cache = layer_norm_forward(res1[t], cfg.embed_dim)
+        if not cache.mlp[t] then cache.mlp[t] = {} end
+        cache.mlp[t].norm_cache = norm_cache
+        local fc1_out = ffi.new("double[?]", 4 * cfg.embed_dim)
+        local fc1_cache = {input = norm_res1}
+        for j = 1, 4 * cfg.embed_dim do
+            local sum = 0
+            for i = 1, cfg.embed_dim do
+                sum = sum + norm_res1[i-1] * block.mlp.fc1:get(i, j)
+            end
+            fc1_out[j-1] = sum
+        end
+        local relu_out, relu_mask = relu_forward(fc1_out, 4 * cfg.embed_dim)
+        fc1_cache.output = fc1_out
+        fc1_cache.relu_mask = relu_mask
+        cache.mlp.fc1[t] = fc1_cache
+        local fc2_out = ffi.new("double[?]", cfg.embed_dim)
+        local fc2_cache = {input = relu_out}
+        for d = 1, cfg.embed_dim do
+            local sum = 0
+            for j = 1, 4 * cfg.embed_dim do
+                sum = sum + relu_out[j-1] * block.mlp.fc2:get(j, d)
+            end
+            fc2_out[d-1] = sum
+        end
+        fc2_cache.output = fc2_out
+        cache.mlp.fc2[t] = fc2_cache
+        local mlp_drop, mlp_dropout_mask = dropout_forward(fc2_out, cfg.embed_dim, cfg.dropout)
+        mlp_outputs[t] = mlp_drop
+        cache.mlp.fc2[t].dropout_mask = mlp_dropout_mask
+    end
+    cache.residual_final = {}
+    local out_tokens = {}
+    for t = 1, seq_len do
+        out_tokens[t] = { data = ffi.new("double[?]", cfg.embed_dim) }
+        for d = 0, cfg.embed_dim-1 do
+            out_tokens[t].data[d] = res1[t][d] + mlp_outputs[t][d]
+        end
+        cache.residual_final[t] = out_tokens[t].data
+    end
+    return out_tokens, cache
+end
+
+--------------------------------------------------
+-- Forward pass for the full model (batch version) with cache storage
+--------------------------------------------------
+local function forward_with_cache(inputs)
+    local batch_size = #inputs
+    local seq_len = #inputs[1]
+    local caches = {}
+    caches.embeddings = {}
+    local activations = {}
+    activations[1] = {}
+    for b = 1, batch_size do
+        activations[1][b] = {}
+        caches.embeddings[b] = {}
+        for t = 1, seq_len do
+            local emb = ffi.new("double[?]", cfg.embed_dim)
+            for d = 1, cfg.embed_dim do
+                emb[d-1] = GPT.wte:get(inputs[b][t], d) + GPT.wpe:get(t, d)
+            end
+            activations[1][b][t] = { data = emb }
+            caches.embeddings[b][t] = { input_token = inputs[b][t] }
+        end
+    end
+    caches.transformer = {}
+    for layer = 1, cfg.num_layers do
+        caches.transformer[layer] = {}
+        activations[layer+1] = {}
+        for b = 1, batch_size do
+            local norm_tokens = {}
+            local norm_caches = {}
+            for t = 1, seq_len do
+                local norm, norm_cache = layer_norm_forward(activations[layer][b][t].data, cfg.embed_dim)
+                norm_tokens[t] = norm
+                norm_caches[t] = norm_cache
+            end
+            caches.transformer[layer].norm = norm_caches
+            local block_out, block_cache = transformer_block_forward(GPT.blocks[layer], norm_tokens)
+            caches.transformer[layer].block = block_cache
+            activations[layer+1][b] = block_out
+        end
+    end
+    caches.projection = {}
+    local logits = {}
+    local final_layer = #activations
+    for b = 1, batch_size do
+        logits[b] = {}
+        caches.projection[b] = {}
+        for t = 1, seq_len do
+            local token_act = activations[final_layer][b][t].data
+            local logit = ffi.new("double[?]", cfg.vocab_size + 1)
+            local proj_cache = {input = token_act}
+            for v = 0, cfg.vocab_size do
+                local sum = 0
+                for d = 1, cfg.embed_dim do
+                    sum = sum + token_act[d-1] * GPT.head:get(d, v+1)
+                end
+                logit[v] = sum
+            end
+            logits[b][t] = logit
+            caches.projection[b][t] = proj_cache
+        end
+    end
+    return logits, caches, activations
+end
+
+--------------------------------------------------
+-- Backward pass for final projection layer
+--------------------------------------------------
+local function backward_projection(dlogits, caches, activations)
+    local batch_size = #dlogits
+    local seq_len = #dlogits[1]
+    for b = 1, batch_size do
+        for t = 1, seq_len do
+            local proj_cache = caches.projection[b][t]
+            local token_act = proj_cache.input
+            local dtoken = ffi.new("double[?]", cfg.embed_dim)
+            for d = 0, cfg.embed_dim-1 do dtoken[d] = 0 end
+            for v = 0, cfg.vocab_size do
+                local grad = dlogits[b][t][v]
+                for d = 1, cfg.embed_dim do
+                    GPT.head:add_grad(d, v+1, token_act[d-1] * grad)
+                    dtoken[d-1] = dtoken[d-1] + GPT.head:get(d, v+1) * grad
+                end
+            end
+            activations[#activations][b][t].ddata = dtoken
+        end
+    end
+end
+
+--------------------------------------------------
+-- A very simplified backward pass for one transformer block.
+-- (In a full implementation you would backprop through every operation.)
+local function backward_transformer_block(block, block_cache, dactivation, norm_cache)
+    local seq_len = #dactivation
+    local head_dim = cfg.embed_dim / cfg.num_heads
+
+    -- Backprop through residual connection after MLP
+    local dres2 = {}
+    for t = 1, seq_len do
+        dres2[t] = ffi.new("double[?]", cfg.embed_dim)
+        local src = dactivation[t]
+        if type(src) == "table" then
+            for d = 0, cfg.embed_dim-1 do
+                dres2[t][d] = src[d+1] or 0
+            end
+        else
+            ffi.copy(dres2[t], src, ffi.sizeof("double") * cfg.embed_dim)
+        end
+    end
+
+    -- Backprop through MLP branch
+    local dmlp = {}
+    for t = 1, seq_len do
+        if not block.mlp or not block.mlp.fc1 or not block.mlp.fc2 then
+            error("MLP components missing in transformer block")
+        end
+
+        local fc1_cache = block_cache.mlp.fc1[t]
+        local fc2_cache = block_cache.mlp.fc2[t]
+        local norm_cache_mlp = block_cache.mlp[t].norm_cache
+
+        -- Backprop through MLP dropout
+        local dmlp_dropout = dropout_backward(dres2[t], fc2_cache.dropout_mask, cfg.embed_dim)
+
+        -- Backprop through fc2
+        local dfc2_out = dmlp_dropout
+        local drelu_out = ffi.new("double[?]", 4 * cfg.embed_dim)
+        for j = 1, 4 * cfg.embed_dim do
+            local sum = 0
+            for d = 1, cfg.embed_dim do
+                local grad = dfc2_out[d-1]
+                local weight = block.mlp.fc2:get(j, d)
+                sum = sum + grad * weight
+                block.mlp.fc2:add_grad(j, d, fc1_cache.output[j-1] * grad)
+            end
+            drelu_out[j-1] = sum
+        end
+
+        -- Backprop through ReLU
+        local dfc1_out = relu_backward(drelu_out, fc1_cache.relu_mask, 4 * cfg.embed_dim)
+
+        -- Backprop through fc1
+        local dnorm_mlp = ffi.new("double[?]", cfg.embed_dim)
+        for i = 1, cfg.embed_dim do
+            local sum = 0
+            for j = 1, 4 * cfg.embed_dim do
+                local grad = dfc1_out[j-1]
+                local weight = block.mlp.fc1:get(i, j)
+                sum = sum + grad * weight
+                block.mlp.fc1:add_grad(i, j, norm_cache_mlp.vec[i-1] * grad)  -- Fixed: .vec instead of .input
+            end
+            dnorm_mlp[i-1] = sum
+        end
+
+        -- Backprop through layer norm in MLP branch
+        dmlp[t] = layer_norm_backward(dnorm_mlp, norm_cache_mlp)
+    end
+
+    -- Backprop through residual connection after attention
+    local dres1 = {}
+    for t = 1, seq_len do
+        dres1[t] = ffi.new("double[?]", cfg.embed_dim)
+        for d = 0, cfg.embed_dim-1 do
+            dres1[t][d] = dmlp[t][d] + dres2[t][d]
+        end
+    end
+
+    -- Backprop through attention branch
+    local dattn_proj = {}
+    for t = 1, seq_len do
+        local proj_cache = block_cache.attention.proj[t]
+        local dproj_drop = dropout_backward(dres1[t], proj_cache.dropout_mask, cfg.embed_dim)
+
+        -- Backprop through projection layer
+        local dproj_in = ffi.new("double[?]", cfg.embed_dim)
+        for i = 1, cfg.embed_dim do
+            local sum = 0
+            for d = 1, cfg.embed_dim do
+                local grad = dproj_drop[d-1]
+                local weight = block.attn.proj:get(i, d)
+                sum = sum + grad * weight
+                block.attn.proj:add_grad(i, d, proj_cache.input[i-1] * grad)
+            end
+            dproj_in[i-1] = sum
+        end
+        dattn_proj[t] = dproj_in
+    end
+
+    -- Backprop through multi-head attention
+    local dattn = {}
+    for t = 1, seq_len do
+        dattn[t] = ffi.new("double[?]", cfg.embed_dim)
+        for h = 1, cfg.num_heads do
+            local head_cache = block_cache.attention.heads[t][h]
+            for d = 0, head_dim-1 do
+                dattn[t][(h-1)*head_dim + d] = dattn_proj[t][(h-1)*head_dim + d]
+            end
+
+            local dhead_out = ffi.new("double[?]", head_dim)
+            for d = 0, head_dim-1 do
+                dhead_out[d] = dattn_proj[t][(h-1)*head_dim + d]
+            end
+
+            local dattn_weights = ffi.new("double[?]", seq_len)
+            for j = 1, seq_len do
+                local value = head_cache.values[j]
+                local grad = 0
+                for d = 0, head_dim-1 do
+                    grad = grad + dhead_out[d] * value[d]
+                end
+                dattn_weights[j-1] = grad
+            end
+
+            local d_scores = ffi.new("double[?]", seq_len)
+            local sum_exp = head_cache.sum_exp
+            for j = 1, seq_len do
+                local attn_weight = head_cache.attn_weights[j-1]
+                d_scores[j-1] = (dattn_weights[j-1] * attn_weight * (1 - attn_weight)) / sum_exp
+            end
+
+            local dq = ffi.new("double[?]", head_dim)
+            local dk_list = {}
+            local dv_list = {}
+            for j = 1, seq_len do
+                if j <= t then
+                    local k = head_cache.keys[j]
+                    local v = head_cache.values[j]
+                    for d = 0, head_dim-1 do
+                        dq[d] = dq[d] + d_scores[j-1] * k[d] / math.sqrt(head_dim)
+                    end
+
+                    local dk = ffi.new("double[?]", head_dim)
+                    for d = 0, head_dim-1 do
+                        dk[d] = d_scores[j-1] * head_cache.q[d] / math.sqrt(head_dim)
+                    end
+                    dk_list[j] = dk
+
+                    local dv = ffi.new("double[?]", head_dim)
+                    for d = 0, head_dim-1 do
+                        dv[d] = dattn_weights[j-1] * head_cache.attn_weights[j-1]
+                    end
+                    dv_list[j] = dv
+                end
+            end
+
+            for d = 0, head_dim-1 do
+                for i = 1, cfg.embed_dim do
+                    local input = norm_cache[t].vec[i-1]  -- Corrected variable name
+                    block.attn.q:add_grad(i, (h-1)*head_dim + d + 1, input * dq[d])
+                end
+
+                for j = 1, seq_len do
+                    if j <= t then
+                        local dk = dk_list[j]
+                        local dv = dv_list[j]
+                        local input = norm_cache[t].vec  -- Corrected variable name
+                        for i = 1, cfg.embed_dim do
+                            block.attn.k:add_grad(i, (h-1)*head_dim + d + 1, input[i-1] * dk[d])
+                            block.attn.v:add_grad(i, (h-1)*head_dim + d + 1, input[i-1] * dv[d])
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    -- Backprop through layer norm for attention branch
+    local dnorm = {}
+    for t = 1, seq_len do
+        dnorm[t] = layer_norm_backward(dattn[t], norm_cache[t])
+    end
+
+    -- Combine all gradients
+    local dinput = {}
+    for t = 1, seq_len do
+        dinput[t] = ffi.new("double[?]", cfg.embed_dim)
+        for d = 0, cfg.embed_dim-1 do
+            dinput[t][d] = dnorm[t][d] + dmlp[t][d]
+        end
+    end
+    return dinput
+end
+
+
+
+--------------------------------------------------
+-- Full backward pass for the model
+--------------------------------------------------
+local function backward_full(logits, targets, caches, activations)
+    local batch_size = #logits
+    local seq_len = #logits[1]
+    local dlogits = {}
+    for b = 1, batch_size do
+        dlogits[b] = {}
+        for t = 1, seq_len do
+            local logit = logits[b][t]
+            local dlogit = ffi.new("double[?]", cfg.vocab_size + 1)
+            local max_logit = -math.huge
+            for v = 0, cfg.vocab_size do
+                if logit[v] > max_logit then max_logit = logit[v] end
+            end
+            local sum_exp = 0
+            local exps = {}
+            for v = 0, cfg.vocab_size do
+                exps[v] = math.exp(logit[v] - max_logit)
+                sum_exp = sum_exp + exps[v]
+            end
+            for v = 0, cfg.vocab_size do
+                local softmax = exps[v] / sum_exp
+                dlogit[v] = softmax - (v == targets[b][t] and 1 or 0)
+            end
+            dlogits[b][t] = dlogit
+        end
+    end
+
+    backward_projection(dlogits, caches, activations)
+
+    for layer = cfg.num_layers, 1, -1 do
+        for b = 1, batch_size do
+            local dactivation = {}
+            for t = 1, seq_len do
+                dactivation[t] = activations[layer+1][b][t].ddata or ffi.new("double[?]", cfg.embed_dim)
+            end
+            
+            -- Key fix: Pass GPT.blocks[layer] instead of cache.block
+            local norm_cache = caches.transformer[layer].norm
+            local dnorm = backward_transformer_block(
+                GPT.blocks[layer],          -- Actual model parameters
+                caches.transformer[layer].block, 
+                dactivation, 
+                norm_cache
+            )
+            
+            for t = 1, seq_len do
+                activations[layer][b][t].ddata = dnorm[t]
+            end
+        end
+    end
+
+    for b = 1, batch_size do
+        for t = 1, seq_len do
+            local d_emb = activations[1][b][t].ddata or ffi.new("double[?]", cfg.embed_dim)
+            for d = 1, cfg.embed_dim do
+                GPT.wte:add_grad(caches.embeddings[b][t].input_token, d, d_emb[d-1])
+                GPT.wpe:add_grad(t, d, d_emb[d-1])
+            end
+        end
+    end
+end
+
+--------------------------------------------------
+-- Vocabulary building
+--------------------------------------------------
 local function build_vocabulary(text)
     local word_counts = {}
     local valid_chars = "[^%w%s]"
@@ -162,379 +861,9 @@ local function build_vocabulary(text)
     stmt:finalize()
 end
 
--- Tensor creation helper remains unchanged
-local function create_tensor(rows, cols)
-    local size = rows * cols
-    local data = ffi.new("double[?]", size)
-    local grad = ffi.new("double[?]", size)
-    local m = ffi.new("double[?]", size)  -- First moment
-    local v = ffi.new("double[?]", size)  -- Second moment
-    ffi.fill(data, ffi.sizeof("double") * size, 0)
-    ffi.fill(grad, ffi.sizeof("double") * size, 0)
-    ffi.fill(m, ffi.sizeof("double") * size, 0)
-    ffi.fill(v, ffi.sizeof("double") * size, 0)
-    return {
-        data = data,
-        grad = grad,
-        m = m,
-        v = v,
-        rows = rows,
-        cols = cols,
-        get = function(self, i, j)
-            return self.data[(i-1)*self.cols + (j-1)]
-        end,
-        set = function(self, i, j, val)
-            self.data[(i-1)*self.cols + (j-1)] = val
-        end,
-        add_grad = function(self, i, j, val)
-            self.grad[(i-1)*self.cols + (j-1)] = self.grad[(i-1)*self.cols + (j-1)] + val
-        end,
-        zero_grad = function(self)
-            ffi.fill(self.grad, ffi.sizeof("double") * self.rows * self.cols, 0)
-        end
-    }
-end
-
--- Transformer block: now includes multi-head attention, residual connections,
--- layer norm, feed-forward (MLP), and dropout.
-local function transformer_block()
-    local attn = {
-        -- Full projection matrices (embed_dim x embed_dim)
-        q = create_tensor(cfg.embed_dim, cfg.embed_dim),
-        k = create_tensor(cfg.embed_dim, cfg.embed_dim),
-        v = create_tensor(cfg.embed_dim, cfg.embed_dim),
-        proj = create_tensor(cfg.embed_dim, cfg.embed_dim)
-    }
-    local mlp = {
-        fc1 = create_tensor(cfg.embed_dim, 4 * cfg.embed_dim),  -- expansion
-        fc2 = create_tensor(4 * cfg.embed_dim, cfg.embed_dim)     -- contraction
-    }
-    -- Kaiming initialization for attention parameters
-    local sqrt_k = math.sqrt(1.0 / cfg.embed_dim)
-    for _, component in pairs(attn) do
-        for i = 1, component.rows do
-            for j = 1, component.cols do
-                component:set(i, j, (math.random() - 0.5) * sqrt_k)
-            end
-        end
-    end
-    -- Initialization for MLP layers (using a simple uniform distribution)
-    for _, component in pairs(mlp) do
-        local fan_in = component.rows
-        local bound = math.sqrt(3.0 / fan_in)
-        for i = 1, component.rows do
-            for j = 1, component.cols do
-                component:set(i, j, (math.random() - 0.5) * 2 * bound)
-            end
-        end
-    end
-    return {
-        attn = attn,
-        mlp = mlp
-    }
-end
-
-local function init_model()
-    GPT = {
-        wte = create_tensor(cfg.vocab_size + 2, cfg.embed_dim),  -- word embeddings (+2 for pad/unk)
-        wpe = create_tensor(cfg.seq_len, cfg.embed_dim),         -- positional embeddings
-        blocks = {},
-        head = create_tensor(cfg.embed_dim, cfg.vocab_size + 2)    -- projection to vocab logits
-    }
-    local emb_scale = 1 / math.sqrt(cfg.embed_dim)
-    for i = 0, (cfg.vocab_size + 1) * cfg.embed_dim - 1 do
-        GPT.wte.data[i] = (math.random() - 0.5) * emb_scale
-    end
-    for i = 0, cfg.seq_len * cfg.embed_dim - 1 do
-        GPT.wpe.data[i] = (math.random() - 0.5) * 0.01
-    end
-    for _ = 1, cfg.num_layers do
-        local block = transformer_block()
-        table.insert(GPT.blocks, block)
-    end
-    local head_scale = 1 / math.sqrt(cfg.embed_dim)
-    for i = 0, cfg.embed_dim * (cfg.vocab_size + 1) - 1 do
-        GPT.head.data[i] = (math.random() - 0.5) * head_scale
-    end
-end
-
--- Revised forward pass with multi-head attention, residual connections, layer norm, and MLP.
-local function forward(inputs)
-    print ("forward function started ...")
-    local batch_size = #inputs
-    local seq_len = #inputs[1]
-    local head_dim = cfg.embed_dim / cfg.num_heads
-
-    -- Build embeddings (sum of token and positional embeddings)
-    local activations = {}
-    activations[1] = {}
-    for b = 1, batch_size do
-        activations[1][b] = {}
-        for t = 1, seq_len do
-            local emb = ffi.new("double[?]", cfg.embed_dim)
-            for d = 1, cfg.embed_dim do
-                emb[d-1] = GPT.wte:get(inputs[b][t], d) + GPT.wpe:get(t, d)
-            end
-            activations[1][b][t] = { data = emb, grad = ffi.new("double[?]", cfg.embed_dim) }
-        end
-    end
-
-    -- Process each transformer layer
-    for layer = 1, cfg.num_layers do
-        local block = GPT.blocks[layer]
-        activations[layer+1] = {}
-        for b = 1, batch_size do
-            local new_tokens = {}  -- will hold output tokens for batch b
-            -- Pre-LayerNorm: normalize each token in the sequence
-            local norm_tokens = {}
-            for t = 1, seq_len do
-                norm_tokens[t] = layer_norm(activations[layer][b][t].data, cfg.embed_dim)
-            end
-
-            -- Multi-head Self-Attention
-            local attn_outputs = {}
-            for t = 1, seq_len do
-                attn_outputs[t] = ffi.new("double[?]", cfg.embed_dim)
-                for d = 0, cfg.embed_dim-1 do attn_outputs[t][d] = 0 end
-            end
-
-            -- For each head, compute Q, K, V projections on normalized tokens
-            for h = 1, cfg.num_heads do
-                for i = 1, seq_len do
-                    -- Compute query for token i for head h
-                    local q = ffi.new("double[?]", head_dim)
-                    for d = 1, head_dim do
-                        q[d-1] = 0
-                        for j = 1, cfg.embed_dim do
-                            q[d-1] = q[d-1] + norm_tokens[i][j-1] * block.attn.q:get(j, (h-1)*head_dim + d)
-                        end
-                    end
-                    -- Similarly compute key and value for all tokens for head h
-                    local Q = q
-                    local keys = {}
-                    local values = {}
-                    for j = 1, seq_len do
-                        local k = ffi.new("double[?]", head_dim)
-                        local v = ffi.new("double[?]", head_dim)
-                        for d = 1, head_dim do
-                            k[d-1] = 0
-                            v[d-1] = 0
-                            for r = 1, cfg.embed_dim do
-                                k[d-1] = k[d-1] + norm_tokens[j][r-1] * block.attn.k:get(r, (h-1)*head_dim + d)
-                                v[d-1] = v[d-1] + norm_tokens[j][r-1] * block.attn.v:get(r, (h-1)*head_dim + d)
-                            end
-                        end
-                        keys[j] = k
-                        values[j] = v
-                    end
-                    -- Compute attention weights for token i over all tokens for head h
-                    local scores = ffi.new("double[?]", seq_len)
-                    local max_score = -math.huge
-                    for j = 1, seq_len do
-                        local score = 0
-                        for d = 0, head_dim-1 do
-                            score = score + Q[d] * keys[j][d]
-                        end
-                        score = score / math.sqrt(head_dim)
-                        scores[j-1] = score
-                        if score > max_score then max_score = score end
-                    end
-                    local sum_exp = 0
-                    local exps = ffi.new("double[?]", seq_len)
-                    for j = 1, seq_len do
-                        exps[j-1] = math.exp(scores[j-1] - max_score)
-                        sum_exp = sum_exp + exps[j-1]
-                    end
-                    -- Weighted sum of values
-                    local head_output = ffi.new("double[?]", head_dim)
-                    for d = 0, head_dim-1 do head_output[d] = 0 end
-                    for j = 1, seq_len do
-                        local weight = exps[j-1] / sum_exp
-                        for d = 0, head_dim-1 do
-                            head_output[d] = head_output[d] + weight * values[j][d]
-                        end
-                    end
-                    -- Accumulate head outputs into the full attention output for token i
-                    for d = 0, head_dim-1 do
-                        attn_outputs[i][(h-1)*head_dim + d] = attn_outputs[i][(h-1)*head_dim + d] + head_output[d]
-                    end
-                end
-            end
-
-            -- Apply projection of attention outputs
-            local proj_outputs = {}
-            for t = 1, seq_len do
-                proj_outputs[t] = ffi.new("double[?]", cfg.embed_dim)
-                for d = 1, cfg.embed_dim do
-                    local sum = 0
-                    for i = 1, cfg.embed_dim do
-                        sum = sum + attn_outputs[t][i-1] * block.attn.proj:get(i, d)
-                    end
-                    proj_outputs[t][d-1] = sum
-                end
-                -- Apply dropout on attention projection
-                proj_outputs[t] = dropout(proj_outputs[t], cfg.embed_dim, cfg.dropout)
-            end
-
-            -- First Residual Connection: add projection output to original activations
-            local res1 = {}
-            for t = 1, seq_len do
-                res1[t] = ffi.new("double[?]", cfg.embed_dim)
-                for d = 0, cfg.embed_dim-1 do
-                    res1[t][d] = activations[layer][b][t].data[d] + proj_outputs[t][d]
-                end
-            end
-
-            -- Second sub-layer: Feed-Forward (MLP)
-            -- Pre-LayerNorm on res1
-            local res1_norm = {}
-            for t = 1, seq_len do
-                res1_norm[t] = layer_norm(res1[t], cfg.embed_dim)
-            end
-            local mlp_outputs = {}
-            for t = 1, seq_len do
-                -- fc1
-                local fc1_out = ffi.new("double[?]", 4 * cfg.embed_dim)
-                for j = 1, 4 * cfg.embed_dim do
-                    local sum = 0
-                    for i = 1, cfg.embed_dim do
-                        sum = sum + res1_norm[t][i-1] * block.mlp.fc1:get(i, j)
-                    end
-                    fc1_out[j-1] = math.max(0, sum)  -- ReLU activation
-                end
-                -- fc2
-                local fc2_out = ffi.new("double[?]", cfg.embed_dim)
-                for d = 1, cfg.embed_dim do
-                    local sum = 0
-                    for j = 1, 4 * cfg.embed_dim do
-                        sum = sum + fc1_out[j-1] * block.mlp.fc2:get(j, d)
-                    end
-                    fc2_out[d-1] = sum
-                end
-                -- Dropout on MLP output
-                mlp_outputs[t] = dropout(fc2_out, cfg.embed_dim, cfg.dropout)
-            end
-
-            -- Second Residual Connection: add MLP output to res1
-            new_tokens = {}
-            for t = 1, seq_len do
-                new_tokens[t] = {
-                    data = ffi.new("double[?]", cfg.embed_dim),
-                    grad = ffi.new("double[?]", cfg.embed_dim)
-                }
-                for d = 0, cfg.embed_dim-1 do
-                    new_tokens[t].data[d] = res1[t][d] + mlp_outputs[t][d]
-                end
-            end
-            activations[layer+1][b] = new_tokens
-        end
-    end
-
-    -- Final logits computation: project final activations to vocabulary space
-    local logits = {}
-    for b = 1, batch_size do
-        logits[b] = {}
-        for t = 1, seq_len do
-            logits[b][t] = ffi.new("double[?]", cfg.vocab_size + 1)
-            for v = 0, cfg.vocab_size do
-                local sum = 0
-                for d = 1, cfg.embed_dim do
-                    sum = sum + activations[#activations][b][t].data[d-1] * GPT.head:get(d, v+1)
-                end
-                logits[b][t][v] = sum
-            end
-        end
-    end
-
-    return logits
-end
-
--- compute_gradients, cross_entropy, adam_step, get_batch, save_model remain similar
--- (For brevity, we assume these functions are as in your original script.)
-
-local function compute_gradients(logits, targets)
-    print ("compute gradients function started ....")
-    local batch_size = #targets
-    local seq_len = #targets[1]
-    GPT.head:zero_grad()
-    GPT.wte:zero_grad()
-    GPT.wpe:zero_grad()
-    for _, block in ipairs(GPT.blocks) do
-        block.attn.q:zero_grad()
-        block.attn.k:zero_grad()
-        block.attn.v:zero_grad()
-        block.attn.proj:zero_grad()
-        block.mlp.fc1:zero_grad()
-        block.mlp.fc2:zero_grad()
-    end
-    for b = 1, batch_size do
-        for t = 1, seq_len do
-            local logits_bt = logits[b][t]
-            local target = targets[b][t]
-            local max_logit = -math.huge
-            for v = 0, cfg.vocab_size do
-                if logits_bt[v] > max_logit then
-                    max_logit = logits_bt[v]
-                end
-            end
-            local sum_exp = 0.0
-            local exps = ffi.new("double[?]", cfg.vocab_size+1)
-            for v = 0, cfg.vocab_size do
-                exps[v] = math.exp(logits_bt[v] - max_logit)
-                sum_exp = sum_exp + exps[v]
-            end
-            for v = 0, cfg.vocab_size do
-                local softmax_grad = exps[v] / sum_exp * ((v == target and 1 or 0) - exps[target] / sum_exp)
-                for d = 1, cfg.embed_dim do
-                    GPT.head:add_grad(d, v+1, softmax_grad)
-                end
-            end
-        end
-    end
-    local scale = 1.0 / (batch_size * seq_len)
-    for i = 0, GPT.head.rows*GPT.head.cols-1 do
-        GPT.head.grad[i] = GPT.head.grad[i] * scale
-    end
-end
-
-local function cross_entropy(logits, targets)
-    print("cross entropy started ...")
-    local batch_size = #targets
-    local seq_len = #targets[1]
-    local loss = 0.0
-    for b = 1, batch_size do
-        for t = 1, seq_len do
-            local logits_bt = logits[b][t]
-            local target = targets[b][t]
-            local max_logit = -math.huge
-            for v = 0, cfg.vocab_size do
-                if logits_bt[v] > max_logit then max_logit = logits_bt[v] end
-            end
-            local sum_exp = 0.0
-            for v = 0, cfg.vocab_size do
-                sum_exp = sum_exp + math.exp(logits_bt[v] - max_logit)
-            end
-            loss = loss - (logits_bt[target] - max_logit - math.log(sum_exp))
-        end
-    end
-    return loss / (batch_size * seq_len)
-end
-
-local function adam_step(param, t)
-    print ("Adam step function started...")
-    local lr = cfg.lr
-    local beta1 = cfg.beta1
-    local beta2 = cfg.beta2
-    local eps = cfg.eps
-    for i = 0, param.rows * param.cols - 1 do
-        param.m[i] = beta1 * param.m[i] + (1 - beta1) * param.grad[i]
-        param.v[i] = beta2 * param.v[i] + (1 - beta2) * param.grad[i] * param.grad[i]
-        local m_hat = param.m[i] / (1 - math.pow(beta1, t))
-        local v_hat = param.v[i] / (1 - math.pow(beta2, t))
-        param.data[i] = param.data[i] - lr * m_hat / (math.sqrt(v_hat) + eps)
-    end
-end
-
+--------------------------------------------------
+-- Get a random batch from the text tokens
+--------------------------------------------------
 local function get_batch(text_tokens)
     local inputs = {}
     local targets = {}
@@ -552,6 +881,9 @@ local function get_batch(text_tokens)
     return inputs, targets
 end
 
+--------------------------------------------------
+-- Save model parameters to the database
+--------------------------------------------------
 local function save_model()
     db:exec("BEGIN TRANSACTION")
     db:exec("DELETE FROM embeddings")
@@ -607,6 +939,53 @@ local function save_model()
     db:exec("COMMIT")
 end
 
+--------------------------------------------------
+-- Adam update step for parameters
+--------------------------------------------------
+local function adam_step(param, t)
+    local lr = cfg.lr
+    local beta1 = cfg.beta1
+    local beta2 = cfg.beta2
+    local eps = cfg.eps
+    for i = 0, param.rows * param.cols - 1 do
+        param.m[i] = beta1 * param.m[i] + (1 - beta1) * param.grad[i]
+        param.v[i] = beta2 * param.v[i] + (1 - beta2) * param.grad[i] * param.grad[i]
+        local m_hat = param.m[i] / (1 - math.pow(beta1, t))
+        local v_hat = param.v[i] / (1 - math.pow(beta2, t))
+        param.data[i] = param.data[i] - lr * m_hat / (math.sqrt(v_hat) + eps)
+    end
+end
+
+--------------------------------------------------
+-- Initialize the model parameters
+--------------------------------------------------
+local function init_model()
+    GPT = {
+        wte = create_tensor(cfg.vocab_size + 2, cfg.embed_dim),  -- word embeddings (+2 for pad/unk)
+        wpe = create_tensor(cfg.seq_len, cfg.embed_dim),         -- positional embeddings
+        blocks = {},
+        head = create_tensor(cfg.embed_dim, cfg.vocab_size + 2)    -- projection to vocab logits
+    }
+    local emb_scale = 1 / math.sqrt(cfg.embed_dim)
+    for i = 0, (cfg.vocab_size + 1) * cfg.embed_dim - 1 do
+        GPT.wte.data[i] = (math.random() - 0.5) * emb_scale
+    end
+    for i = 0, cfg.seq_len * cfg.embed_dim - 1 do
+        GPT.wpe.data[i] = (math.random() - 0.5) * 0.01
+    end
+    for _ = 1, cfg.num_layers do
+        local block = transformer_block()
+        table.insert(GPT.blocks, block)
+    end
+    local head_scale = 1 / math.sqrt(cfg.embed_dim)
+    for i = 0, cfg.embed_dim * (cfg.vocab_size + 1) - 1 do
+        GPT.head.data[i] = (math.random() - 0.5) * head_scale
+    end
+end
+
+--------------------------------------------------
+-- Training loop: forward pass, loss, backward pass, parameter update, and save
+--------------------------------------------------
 local function train(text_path)
     local text = io.open(text_path, "r"):read("*a")
     build_vocabulary(text)
@@ -617,16 +996,31 @@ local function train(text_path)
     end
     print("Training...")
     for iter = 1, cfg.max_iters do
-	print ("iteration started ...")
         local inputs, targets = get_batch(text_tokens)
-        local logits = forward(inputs)
-        local loss = cross_entropy(logits, targets)
-        compute_gradients(logits, targets)
+        local logits, caches, activations = forward_with_cache(inputs)
+        local loss = 0.0
+        for b = 1, cfg.batch_size do
+            for t = 1, cfg.seq_len do
+                local logit = logits[b][t]
+                local target = targets[b][t]
+                local max_logit = -math.huge
+                for v = 0, cfg.vocab_size do
+                    if logit[v] > max_logit then max_logit = logit[v] end
+                end
+                local sum_exp = 0.0
+                for v = 0, cfg.vocab_size do
+                    sum_exp = sum_exp + math.exp(logit[v] - max_logit)
+                end
+                loss = loss - (logit[target] - max_logit - math.log(sum_exp))
+            end
+        end
+        loss = loss / (cfg.batch_size * cfg.seq_len)
+        print(string.format("Iter %d/%d | Loss: %.4f", iter, cfg.max_iters, loss))
+        backward_full(logits, targets, caches, activations)
         adam_step(GPT.head, iter)
         adam_step(GPT.wte, iter)
         adam_step(GPT.wpe, iter)
         for _, block in ipairs(GPT.blocks) do
-	    print ("block working...")
             adam_step(block.attn.q, iter)
             adam_step(block.attn.k, iter)
             adam_step(block.attn.v, iter)
@@ -634,13 +1028,8 @@ local function train(text_path)
             adam_step(block.mlp.fc1, iter)
             adam_step(block.mlp.fc2, iter)
         end
-
         save_model()
-
-        if iter % 100 == 0 then
-            collectgarbage()
-            print(string.format("Iter %d/%d | Loss: %.4f", iter, cfg.max_iters, loss))
-        end
+	collectgarbage()
     end
     db:close()
     print("Training complete! Model saved to " .. cfg.model_db)
