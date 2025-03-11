@@ -1,3 +1,4 @@
+-- LUA basic GPT
 local sqlite3 = require('lsqlite3')
 local math = require('math')
 local ffi = require('ffi')
