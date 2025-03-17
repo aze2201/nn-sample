@@ -18,7 +18,7 @@ local cfg = {
     seq_len = 128,
     lr = 3e-4,
     batch_size = 16,
-    max_iters = 1,    -- Increased for more training
+    max_iters = 100,    -- Increased for more training
     dropout = 0.2,
     model_db = 'gpt_model.db',
     beta1 = 0.9,
@@ -246,10 +246,10 @@ local function create_tensor(rows, cols)
     local grad = ffi.new("double[?]", size)
     local m = ffi.new("double[?]", size)  -- First moment
     local v = ffi.new("double[?]", size)  -- Second moment
-    ffi.fill(data, ffi.sizeof("double") * size, 0)
-    ffi.fill(grad, ffi.sizeof("double") * size, 0)
-    ffi.fill(m, ffi.sizeof("double") * size, 0)
-    ffi.fill(v, ffi.sizeof("double") * size, 0)
+    ffi.fill(data, ffi.sizeof("double") * size, 0)  -- Initialize data to 0
+    ffi.fill(grad, ffi.sizeof("double") * size, 0)  -- Initialize grad to 0
+    ffi.fill(m, ffi.sizeof("double") * size, 0)    -- Initialize m to 0
+    ffi.fill(v, ffi.sizeof("double") * size, 0)    -- Initialize v to 0
     return {
         data = data,
         grad = grad,
@@ -267,7 +267,7 @@ local function create_tensor(rows, cols)
             self.grad[(i-1)*self.cols + (j-1)] = self.grad[(i-1)*self.cols + (j-1)] + val
         end,
         zero_grad = function(self)
-            ffi.fill(self.grad, ffi.sizeof("double") * self.rows * self.cols, 0)
+            ffi.fill(self.grad, ffi.sizeof("double") * self.rows * self.cols, 0) -- Zero out gradients
         end
     }
 end
@@ -277,8 +277,8 @@ local function create_bias(size)
     local grad = ffi.new("double[?]", size)
     local m = ffi.new("double[?]", size)
     local v = ffi.new("double[?]", size)
-    ffi.fill(data, ffi.sizeof("double") * size, 0)
-    ffi.fill(grad, ffi.sizeof("double") * size, 0)
+    ffi.fill(data, ffi.sizeof("double") * size, 0)  -- Initialize data to 0
+    ffi.fill(grad, ffi.sizeof("double") * size, 0)  -- Initialize grad to 0
     ffi.fill(m, ffi.sizeof("double") * size, 0)
     ffi.fill(v, ffi.sizeof("double") * size, 0)
     return {
@@ -301,6 +301,8 @@ local function create_bias(size)
         end
     }
 end
+
+
 
 
 --------------------------------------------------
@@ -1120,14 +1122,15 @@ local function zero_gradients()
             end
         end
         for _, component in pairs(GPT.blocks[i].mlp) do
-             if component.zero_grad then
+            if component.zero_grad then
                 component:zero_grad()  -- Use colon operator here
             end
         end
     end
-    GPT.head:zero_grad()       -- Use colon operator here
-    GPT.head_bias:zero_grad()  -- Use colon operator here
+    GPT.head:zero_grad()        -- Use colon operator here
+    GPT.head_bias:zero_grad() -- Use colon operator here
 end
+
 
 --------------------------------------------------
 -- Byte-Level BPE Tokenizer Training
@@ -1480,8 +1483,8 @@ local function save_model()
                 for i = 1, component.size do
                     layer_stmt:bind(1, layer_num)
                     layer_stmt:bind(2, component_name)
-                    layer_stmt:bind(3, i)
-                    layer_stmt:bind(4, 1)
+                    layer_stmt:bind(3, 1)
+                    layer_stmt:bind(4, i)
                     layer_stmt:bind(5, component:get(i))
                     layer_stmt:step()
                     layer_stmt:reset()
@@ -1507,8 +1510,8 @@ local function save_model()
                 for i = 1, component.size do
                     layer_stmt:bind(1, layer_num)
                     layer_stmt:bind(2, component_name)
-                    layer_stmt:bind(3, i)
-                    layer_stmt:bind(4, 1)
+                    layer_stmt:bind(3, 1)
+                    layer_stmt:bind(4, i)
                     layer_stmt:bind(5, component:get(i))
                     layer_stmt:step()
                     layer_stmt:reset()
