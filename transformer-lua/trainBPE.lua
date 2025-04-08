@@ -1,4 +1,3 @@
--- LUA basic GPT with Gradient Clipping, Bias Handling, Improved Backpropagation, and Byte-Level BPE
 local sqlite3 = require('lsqlite3')
 local math = require('math')
 local ffi = require('ffi')
@@ -11,21 +10,30 @@ ffi.cdef[[
 
 -- Configuration
 local cfg = {
-    vocab_size = 256,  -- Initial vocab size for byte-level
-    embed_dim = 128,
+    vocab_size = 256,   -- Initial vocab size for byte-level
+    embed_dim = 256,
     num_heads = 8,      -- must divide embed_dim evenly
     num_layers = 6,
-    seq_len = 128,
+    seq_len = 256,      -- Increased sequence length
     lr = 3e-4,
-    batch_size = 16,
-    max_iters = 100,    -- Increased for more training
-    dropout = 0.2,
+    batch_size = 8,     -- Reduced batch size for memory efficiency
+    max_iters = 1,   -- Increased for more training
+    dropout = 0.1,      -- Reduced dropout
     model_db = 'gpt_model.db',
     beta1 = 0.9,
     beta2 = 0.999,
     eps = 1e-8,
-    grad_clip = 1.0,  -- Gradient clipping threshold
-    bpe_merges = 50, -- Number of BPE merges to perform
+    grad_clip = 1.0,    -- Gradient clipping threshold
+    bpe_merges = 500,   -- Increased BPE merges
+    relative_pos_bias = true, -- Enable relative position bias
+    num_relative_pos_buckets = 32, -- Number of relative position buckets
+    max_distance = 128, -- Max relative position distance
+    mixed_precision = true, -- Enable mixed precision (if supported)
+    weight_decay = 0.01, -- L2 regularization
+    warmup_steps = 1000, -- Linear warmup steps
+    learning_rate_decay = true, -- Enable learning rate decay
+    final_learning_rate_ratio = 0.1, -- Final learning rate ratio
+    gradient_accumulation_steps = 2, -- Gradient accumulation steps
 }
 
 -- Initialize database with error handling
@@ -75,13 +83,19 @@ local function init_database()
             value REAL,
             PRIMARY KEY (type, position, dim)
         );]],
-          [[CREATE TABLE IF NOT EXISTS biases(
+        [[CREATE TABLE IF NOT EXISTS biases(
             layer INTEGER,
             component TEXT,
             i INTEGER,
             value REAL,
             PRIMARY KEY (layer, component, i)
         );]],
+        [[CREATE TABLE IF NOT EXISTS relative_pos_bias(
+            bucket INTEGER,
+            head INTEGER,
+            value REAL,
+            PRIMARY KEY (bucket, head)
+        );]]
     }
 
     for _, sql in ipairs(tables) do
@@ -154,7 +168,7 @@ local function dropout_forward(vec, size, dropout_rate)
             out[i] = 0
             mask[i] = 0
         else
-            out[i] = vec[i]
+            out[i] = vec[i] / (1 - dropout_rate) -- Inverted dropout
             mask[i] = 1
         end
     end
@@ -280,7 +294,7 @@ local function create_bias(size)
     ffi.fill(data, ffi.sizeof("double") * size, 0)  -- Initialize data to 0
     ffi.fill(grad, ffi.sizeof("double") * size, 0)  -- Initialize grad to 0
     ffi.fill(m, ffi.sizeof("double") * size, 0)
-    ffi.fill(v, ffi.sizeof("double") * size, 0)
+    ffi.fill(v, ffi.sizeof("double") * size)
     return {
         data = data,
         grad = grad,
@@ -294,7 +308,7 @@ local function create_bias(size)
             self.data[i-1] = val
         end,
         add_grad = function(self, i, val)
-          self.grad[i-1] = self.grad[i-1] + val
+            self.grad[i-1] = self.grad[i-1] + val
         end,
         zero_grad = function(self)  -- Correctly define zero_grad for biases
             ffi.fill(self.grad, ffi.sizeof("double") * self.size, 0)
@@ -302,8 +316,60 @@ local function create_bias(size)
     }
 end
 
+--------------------------------------------------
+-- Relative Position Bias
+--------------------------------------------------
+local function create_relative_position_bias()
+    local num_buckets = cfg.num_relative_pos_buckets
+    local num_heads = cfg.num_heads
+    local data = ffi.new("double[?]", num_buckets * num_heads)
+    local grad = ffi.new("double[?]", num_buckets * num_heads)
+    local m = ffi.new("double[?]", num_buckets * num_heads)
+    local v = ffi.new("double[?]", num_buckets * num_heads)
+    ffi.fill(data, ffi.sizeof("double") * (num_buckets * num_heads), 0)
+    ffi.fill(grad, ffi.sizeof("double") * (num_buckets * num_heads), 0)
+    ffi.fill(m, ffi.sizeof("double") * (num_buckets * num_heads), 0)
+    ffi.fill(v, ffi.sizeof("double") * (num_buckets * num_heads), 0)
 
+    return {
+        data = data,
+        grad = grad,
+        m = m,
+        v = v,
+        num_buckets = num_buckets,
+        num_heads = num_heads,
+        get = function(self, bucket, head)
+            return self.data[(bucket-1) * self.num_heads + (head-1)]
+        end,
+        set = function(self, bucket, head, val)
+            self.data[(bucket-1) * self.num_heads + (head-1)] = val
+        end,
+        add_grad = function(self, bucket, head, val)
+            self.grad[(bucket-1) * self.num_heads + (head-1)] = self.grad[(bucket-1) * self.num_heads + (head-1)] + val
+        end,
+        zero_grad = function(self)
+            ffi.fill(self.grad, ffi.sizeof("double") * self.num_buckets * self.num_heads, 0)
+        end
+    }
+end
 
+local function relative_position_bucket(relative_position, bidirectional, num_buckets, max_distance)
+    local ret = 0
+    local sign = (relative_position > 0) and 1 or -1
+    local pos = math.abs(relative_position)
+    if bidirectional then
+        pos = math.min(pos, max_distance / 2)
+    else
+        pos = math.min(pos, max_distance)
+    end
+    local max_ratio = max_distance / num_buckets
+    local val = math.log(pos / max_ratio) / math.log(2)
+    local m = math.floor(val)
+    ret = m + num_buckets / 2
+    ret = math.floor(math.max(0, math.min(num_buckets - 1, ret)))
+    ret = ret + (bidirectional and (sign + 1) * num_buckets / 2 or 0)
+    return ret + 1
+end
 
 --------------------------------------------------
 -- Transformer block constructor (initializes parameters)
@@ -329,37 +395,38 @@ local function transformer_block()
         fc2_bias = create_bias(cfg.embed_dim)
     }
 
-    -- Initialize attention weights
-    local sqrt_k = math.sqrt(1.0 / cfg.embed_dim)
+    -- Initialize attention weights (Kaiming Normal)
+    local fan_in = cfg.embed_dim
+    local std = math.sqrt(2.0 / fan_in)
     for _, component in pairs(attn) do
-      if component.rows then -- Check if it's a tensor
-        for i = 1, component.rows do
-            for j = 1, component.cols do
-                component:set(i, j, (math.random() - 0.5) * sqrt_k)
+        if component.rows then -- Check if it's a tensor
+            for i = 1, component.rows do
+                for j = 1, component.cols do
+                    component:set(i, j, math.randomGaussian() * std)
+                end
+            end
+        elseif component.size then -- Check if it's a bias
+            for i = 1, component.size do
+                component:set(i, 0)  -- Initialize biases to zero
             end
         end
-      elseif component.size then -- Check if it's a bias
-        for i = 1, component.size do
-          component:set(i, (math.random() - 0.5) * sqrt_k)  -- Initialize biases
-        end
-      end
     end
 
-    -- Initialize MLP weights
-   for _, component in pairs(mlp) do
-      if component.rows then -- Check if it's a tensor (not bias)
-          local fan_in = component.rows
-          local bound = math.sqrt(3.0 / fan_in)
-          for i = 1, component.rows do
-              for j = 1, component.cols do
-                  component:set(i, j, (math.random() - 0.5) * 2 * bound)
-              end
-          end
-      elseif component.size then
-          for i = 1, component.size do
-              component:set(i, 0)
-          end
-      end
+    -- Initialize MLP weights (Kaiming Normal)
+    fan_in = cfg.embed_dim
+    std = math.sqrt(2.0 / fan_in)
+    for _, component in pairs(mlp) do
+        if component.rows then -- Check if it's a tensor (not bias)
+            for i = 1, component.rows do
+                for j = 1, component.cols do
+                    component:set(i, j, math.randomGaussian() * std)
+                end
+            end
+        elseif component.size then
+            for i = 1, component.size do
+                component:set(i, 0)
+            end
+        end
     end
 
     return {
@@ -371,7 +438,7 @@ end
 --------------------------------------------------
 -- Transformer block forward with causal masking and cache for backprop
 --------------------------------------------------
-local function transformer_block_forward(block, norm_tokens)
+local function transformer_block_forward(block, norm_tokens, relative_pos_bias)
     local head_dim = cfg.embed_dim / cfg.num_heads
     local seq_len = #norm_tokens
     local cache = {}
@@ -386,18 +453,18 @@ local function transformer_block_forward(block, norm_tokens)
 
     for h = 1, cfg.num_heads do
         for i = 1, seq_len do
-          local head_cache = {}
+            local head_cache = {}
 
-          -- Compute query for token i for head h
-          local q = ffi.new("double[?]", head_dim)
-          for d = 1, head_dim do
-              local bias_val = block.attn.q_bias:get((h-1)*head_dim + d)
-              q[d-1] = bias_val -- Add bias to q
-              for j = 1, cfg.embed_dim do
-                q[d-1] = q[d-1] + norm_tokens[i][j-1] * block.attn.q:get(j, (h-1)*head_dim + d)
-              end
-          end
-          head_cache.q = q
+            -- Compute query for token i for head h
+            local q = ffi.new("double[?]", head_dim)
+            for d = 1, head_dim do
+                local bias_val = block.attn.q_bias:get((h-1)*head_dim + d)
+                q[d-1] = bias_val -- Add bias to q
+                for j = 1, cfg.embed_dim do
+                    q[d-1] = q[d-1] + norm_tokens[i][j-1] * block.attn.q:get(j, (h-1)*head_dim + d)
+                end
+            end
+            head_cache.q = q
 
             -- Compute keys and values for all tokens
             local keys = {}
@@ -411,7 +478,7 @@ local function transformer_block_forward(block, norm_tokens)
                     k[d-1] = k_bias_val  -- Add bias
                     v[d-1] = v_bias_val  -- Add bias
                     for r = 1, cfg.embed_dim do
-					k[d-1] = k[d-1] + norm_tokens[j][r-1] * block.attn.k:get(r, (h-1)*head_dim + d)
+                        k[d-1] = k[d-1] + norm_tokens[j][r-1] * block.attn.k:get(r, (h-1)*head_dim + d)
                         v[d-1] = v[d-1] + norm_tokens[j][r-1] * block.attn.v:get(r, (h-1)*head_dim + d)
                     end
                 end
@@ -431,6 +498,13 @@ local function transformer_block_forward(block, norm_tokens)
                         score = score + q[d] * keys[j][d]
                     end
                     score = score / math.sqrt(head_dim)
+
+                    -- Add relative position bias
+                    if cfg.relative_pos_bias then
+                        local relative_pos = i - j
+                        local bucket = relative_position_bucket(relative_pos, false, cfg.num_relative_pos_buckets, cfg.max_distance)
+                        score = score + relative_pos_bias:get(bucket, h)
+                    end
                 else
                     score = -math.huge  -- Mask out future tokens
                 end
@@ -517,20 +591,20 @@ local function transformer_block_forward(block, norm_tokens)
     local mlp_outputs = {}
 
     for t = 1, seq_len do
-      local norm_res1, norm_cache = layer_norm_forward(res1[t], cfg.embed_dim)
-      if not cache.mlp[t] then cache.mlp[t] = {} end
-      cache.mlp[t].norm_cache = norm_cache
+        local norm_res1, norm_cache = layer_norm_forward(res1[t], cfg.embed_dim)
+        if not cache.mlp[t] then cache.mlp[t] = {} end
+        cache.mlp[t].norm_cache = norm_cache
 
-      local fc1_out = ffi.new("double[?]", 4 * cfg.embed_dim)
-      local fc1_cache = {input = norm_res1}
+        local fc1_out = ffi.new("double[?]", 4 * cfg.embed_dim)
+        local fc1_cache = {input = norm_res1}
 
-      for j = 1, 4 * cfg.embed_dim do
-          local sum = block.mlp.fc1_bias:get(j)  -- Initialize with bias
-          for i = 1, cfg.embed_dim do
-              sum = sum + norm_res1[i-1] * block.mlp.fc1:get(i, j)
-          end
-          fc1_out[j-1] = sum
-      end
+        for j = 1, 4 * cfg.embed_dim do
+            local sum = block.mlp.fc1_bias:get(j)  -- Initialize with bias
+            for i = 1, cfg.embed_dim do
+                sum = sum + norm_res1[i-1] * block.mlp.fc1:get(i, j)
+            end
+            fc1_out[j-1] = sum
+        end
 
         local relu_out, relu_mask = relu_forward(fc1_out, 4 * cfg.embed_dim)
         fc1_cache.output = fc1_out
@@ -540,29 +614,29 @@ local function transformer_block_forward(block, norm_tokens)
         local fc2_out = ffi.new("double[?]", cfg.embed_dim)
         local fc2_cache = {input = relu_out}
         for d = 1, cfg.embed_dim do
-          local sum = block.mlp.fc2_bias:get(d) -- Initialize with bias
-          for j = 1, 4 * cfg.embed_dim do
-              sum = sum + relu_out[j-1] * block.mlp.fc2:get(j, d)
-          end
-          fc2_out[d-1] = sum
+            local sum = block.mlp.fc2_bias:get(d) -- Initialize with bias
+            for j = 1, 4 * cfg.embed_dim do
+                sum = sum + relu_out[j-1] * block.mlp.fc2:get(j, d)
+            end
+            fc2_out[d-1] = sum
         end
-      fc2_cache.output = fc2_out
-      cache.mlp.fc2[t] = fc2_cache
+        fc2_cache.output = fc2_out
+        cache.mlp.fc2[t] = fc2_cache
 
         -- Dropout in MLP
-      local mlp_drop, mlp_dropout_mask = dropout_forward(fc2_out, cfg.embed_dim, cfg.dropout)
-      mlp_outputs[t] = mlp_drop
-      cache.mlp.fc2[t].dropout_mask = mlp_dropout_mask
+        local mlp_drop, mlp_dropout_mask = dropout_forward(fc2_out, cfg.embed_dim, cfg.dropout)
+        mlp_outputs[t] = mlp_drop
+        cache.mlp.fc2[t].dropout_mask = mlp_dropout_mask
     end
 
     cache.residual_final = {}
     local out_tokens = {}
     for t = 1, seq_len do
-      out_tokens[t] = { data = ffi.new("double[?]", cfg.embed_dim) }
-      for d = 0, cfg.embed_dim-1 do
-        out_tokens[t].data[d] = res1[t][d] + mlp_outputs[t][d]
-      end
-      cache.residual_final[t] = out_tokens[t].data
+        out_tokens[t] = { data = ffi.new("double[?]", cfg.embed_dim) }
+        for d = 0, cfg.embed_dim-1 do
+            out_tokens[t].data[d] = res1[t][d] + mlp_outputs[t][d]
+        end
+        cache.residual_final[t] = out_tokens[t].data
     end
 
     return out_tokens, cache
@@ -606,7 +680,7 @@ local function forward_with_cache(inputs)
             end
             caches.transformer[layer].norm = norm_caches
 
-            local block_out, block_cache = transformer_block_forward(GPT.blocks[layer], norm_tokens)
+            local block_out, block_cache = transformer_block_forward(GPT.blocks[layer], norm_tokens, GPT.relative_pos_bias)
             caches.transformer[layer].block = block_cache
             activations[layer+1][b] = block_out
         end
@@ -616,22 +690,22 @@ local function forward_with_cache(inputs)
     local final_layer = #activations
 
     for b = 1, batch_size do
-      logits[b] = {}
-      caches.projection[b] = {}
-      for t = 1, seq_len do
-        local token_act = activations[final_layer][b][t].data
-        local logit = ffi.new("double[?]", cfg.vocab_size + 1)
-        local proj_cache = {input = token_act}
-        for v = 0, cfg.vocab_size do
-          local sum = GPT.head_bias:get(v+1)  -- Initialize with bias
-          for d = 1, cfg.embed_dim do
-            sum = sum + token_act[d-1] * GPT.head:get(d, v+1)
-          end
-          logit[v] = sum
+        logits[b] = {}
+        caches.projection[b] = {}
+        for t = 1, seq_len do
+            local token_act = activations[final_layer][b][t].data
+            local logit = ffi.new("double[?]", cfg.vocab_size + 1)
+            local proj_cache = {input = token_act}
+            for v = 0, cfg.vocab_size do
+                local sum = GPT.head_bias:get(v+1)  -- Initialize with bias
+                for d = 1, cfg.embed_dim do
+                    sum = sum + token_act[d-1] * GPT.head:get(d, v+1)
+                end
+                logit[v] = sum
+            end
+            logits[b][t] = logit
+            caches.projection[b][t] = proj_cache
         end
-        logits[b][t] = logit
-        caches.projection[b][t] = proj_cache
-      end
     end
     return logits, caches, activations
 end
@@ -656,7 +730,7 @@ local function backward_projection(dlogits, caches, activations)
                     GPT.head:add_grad(d, v+1, token_act[d-1] * grad)
                     dtoken[d-1] = dtoken[d-1] + GPT.head:get(d, v+1) * grad
                 end
-              GPT.head_bias:add_grad(v+1, grad)  -- Update head bias
+                GPT.head_bias:add_grad(v+1, grad)  -- Update head bias
             end
             activations[#activations][b][t].ddata = dtoken
         end
@@ -667,31 +741,31 @@ end
 -- A very simplified backward pass for one transformer block. (with bias handling)
 --------------------------------------------------
 
-local function backward_transformer_block(block, block_cache, dactivation, norm_cache)
+local function backward_transformer_block(block, block_cache, dactivation, norm_cache, relative_pos_bias)
     local seq_len = #dactivation
     local head_dim = cfg.embed_dim / cfg.num_heads
 
     -- Backprop through residual connection after MLP
     local dres2 = {}
     for t = 1, seq_len do
-      dres2[t] = ffi.new("double[?]", cfg.embed_dim)
-      local src = dactivation[t]
-      if type(src) == "table" then
-        for d = 0, cfg.embed_dim-1 do
-          dres2[t][d] = src[d+1] or 0  -- Handle potential nil values
-        end
-      else
+        dres2[t] = ffi.new("double[?]", cfg.embed_dim)
+        local src = dactivation[t]
+        if type(src) == "table" then
+            for d = 0, cfg.embed_dim-1 do
+                dres2[t][d] = src[d+1] or 0  -- Handle potential nil values
+            end
+        else
 
-        ffi.copy(dres2[t], src, ffi.sizeof("double") * cfg.embed_dim)
-      end
+            ffi.copy(dres2[t], src, ffi.sizeof("double") * cfg.embed_dim)
+        end
     end
 
     -- Backprop through MLP branch
     local dmlp = {}
     for t = 1, seq_len do
-      if not block.mlp or not block.mlp.fc1 or not block.mlp.fc2 then
-          error("MLP components missing in transformer block")  -- More robust error
-      end
+        if not block.mlp or not block.mlp.fc1 or not block.mlp.fc2 then
+            error("MLP components missing in transformer block")  -- More robust error
+        end
 
         local fc1_cache = block_cache.mlp.fc1[t]
         local fc2_cache = block_cache.mlp.fc2[t]
@@ -703,8 +777,8 @@ local function backward_transformer_block(block, block_cache, dactivation, norm_
         -- Backprop through fc2
         local dfc2_out = dmlp_dropout
         local drelu_out = ffi.new("double[?]", 4 * cfg.embed_dim)
-      local grad_fc2_bias = ffi.new("double[?]", cfg.embed_dim)  -- Gradient for fc2 bias
-      ffi.fill(grad_fc2_bias, ffi.sizeof("double") * cfg.embed_dim, 0)
+        local grad_fc2_bias = ffi.new("double[?]", cfg.embed_dim)  -- Gradient for fc2 bias
+        ffi.fill(grad_fc2_bias, ffi.sizeof("double") * cfg.embed_dim, 0)
 
         for j = 1, 4 * cfg.embed_dim do
             local sum = 0
@@ -712,8 +786,8 @@ local function backward_transformer_block(block, block_cache, dactivation, norm_
                 local grad = dfc2_out[d-1]
                 local weight = block.mlp.fc2:get(j, d)
                 sum = sum + grad * weight
-              block.mlp.fc2:add_grad(j, d, fc1_cache.output[j-1] * grad)
-              grad_fc2_bias[d-1] = grad_fc2_bias[d-1] + fc1_cache.output[j-1] * grad
+                block.mlp.fc2:add_grad(j, d, fc1_cache.output[j-1] * grad)
+                grad_fc2_bias[d-1] = grad_fc2_bias[d-1] + fc1_cache.output[j-1] * grad
             end
             drelu_out[j-1] = sum
         end
@@ -723,8 +797,8 @@ local function backward_transformer_block(block, block_cache, dactivation, norm_
 
         -- Backprop through fc1
         local dnorm_mlp = ffi.new("double[?]", cfg.embed_dim)
-      local grad_fc1_bias = ffi.new("double[?]", 4 * cfg.embed_dim) -- Gradient for fc1 bias
-      ffi.fill(grad_fc1_bias, ffi.sizeof("double") * (4 * cfg.embed_dim), 0)
+        local grad_fc1_bias = ffi.new("double[?]", 4 * cfg.embed_dim) -- Gradient for fc1 bias
+        ffi.fill(grad_fc1_bias, ffi.sizeof("double") * (4 * cfg.embed_dim), 0)
 
         for i = 1, cfg.embed_dim do
             local sum = 0
@@ -733,25 +807,25 @@ local function backward_transformer_block(block, block_cache, dactivation, norm_
                 local weight = block.mlp.fc1:get(i, j)
                 sum = sum + grad * weight
                 block.mlp.fc1:add_grad(i, j, norm_cache_mlp.vec[i-1] * grad)
-              grad_fc1_bias[j-1] = grad_fc1_bias[j-1] + norm_cache_mlp.vec[i-1] * grad  -- Accumulate bias gradient
+                grad_fc1_bias[j-1] = grad_fc1_bias[j-1] + norm_cache_mlp.vec[i-1] * grad  -- Accumulate bias gradient
             end
             dnorm_mlp[i-1] = sum
         end
 
-      -- Update fc1 and fc2 biases
-      for j=1, 4 * cfg.embed_dim do
-        block.mlp.fc1_bias:add_grad(j, grad_fc1_bias[j-1])
-      end
-      for j=1, cfg.embed_dim do
-        block.mlp.fc2_bias:add_grad(j, grad_fc2_bias[j-1])
-      end
+        -- Update fc1 and fc2 biases
+        for j=1, 4 * cfg.embed_dim do
+            block.mlp.fc1_bias:add_grad(j, grad_fc1_bias[j-1])
+        end
+        for j=1, cfg.embed_dim do
+            block.mlp.fc2_bias:add_grad(j, grad_fc2_bias[j-1])
+        end
 
         -- Backprop through layer norm in MLP branch
         dmlp[t] = layer_norm_backward(dnorm_mlp, norm_cache_mlp)
     end
 
     -- Backprop through residual connection after attention
-local dres1 = {}
+    local dres1 = {}
     for t = 1, seq_len do
         dres1[t] = ffi.new("double[?]", cfg.embed_dim)
         for d = 0, cfg.embed_dim-1 do
@@ -768,8 +842,8 @@ local dres1 = {}
         local dproj_dropout = dropout_backward(dres1[t], proj_cache.dropout_mask, cfg.embed_dim)
 
         datt_proj[t] = ffi.new("double[?]", cfg.embed_dim)
-      local grad_proj_bias = ffi.new("double[?]", cfg.embed_dim)
-      ffi.fill(grad_proj_bias, ffi.sizeof("double") * cfg.embed_dim, 0)
+        local grad_proj_bias = ffi.new("double[?]", cfg.embed_dim)
+        ffi.fill(grad_proj_bias, ffi.sizeof("double") * cfg.embed_dim, 0)
 
         for i = 1, cfg.embed_dim do
             local sum = 0
@@ -778,7 +852,7 @@ local dres1 = {}
                 local weight = block.attn.proj:get(i, j)
                 sum = sum + grad * weight
                 block.attn.proj:add_grad(i, j, proj_cache.input[i-1] * grad)
-              grad_proj_bias[j-1] = grad_proj_bias[j-1] + proj_cache.input[i-1] * grad -- Accumulate bias gradient
+                grad_proj_bias[j-1] = grad_proj_bias[j-1] + proj_cache.input[i-1] * grad -- Accumulate bias gradient
             end
             datt_proj[t][i-1] = sum
         end
@@ -828,7 +902,7 @@ local dres1 = {}
             end
             local dscores = ffi.new("double[?]", seq_len)
             for j = 1, seq_len do
-              dscores[j-1] = dexps[j-1] -- no change when score = -huge
+                dscores[j-1] = dexps[j-1] -- no change when score = -huge
             end
 
             -- Backprop through score calculation
@@ -836,25 +910,38 @@ local dres1 = {}
             ffi.fill(dq, ffi.sizeof("double") * head_dim, 0)
             local dkeys = {}
 
-          local grad_q_bias = ffi.new("double[?]", head_dim) -- Gradient for Q bias
-          local grad_k_bias = ffi.new("double[?]", head_dim) -- Gradient for K bias
-          local grad_v_bias = ffi.new("double[?]", head_dim) -- Gradient for V bias
-          ffi.fill(grad_q_bias, ffi.sizeof("double") * head_dim, 0)
-          ffi.fill(grad_k_bias, ffi.sizeof("double") * head_dim, 0)
-          ffi.fill(grad_v_bias, ffi.sizeof("double") * head_dim, 0)
+            local grad_q_bias = ffi.new("double[?]", head_dim)  -- Gradient for Q bias
+            local grad_k_bias = ffi.new("double[?]", head_dim)  -- Gradient for K bias
+            local grad_v_bias = ffi.new("double[?]", head_dim)  -- Gradient for V bias
+            local grad_relative_pos_bias = nil
+            if cfg.relative_pos_bias then
+                grad_relative_pos_bias = ffi.new("double[?]", cfg.num_relative_pos_buckets)
+                ffi.fill(grad_relative_pos_bias, ffi.sizeof("double") * cfg.num_relative_pos_buckets, 0)
+            end
+            ffi.fill(grad_q_bias, ffi.sizeof("double") * head_dim, 0)
+            ffi.fill(grad_k_bias, ffi.sizeof("double") * head_dim, 0)
+            ffi.fill(grad_v_bias, ffi.sizeof("double") * head_dim, 0)
 
             for j = 1, seq_len do
                 dkeys[j] = ffi.new("double[?]", head_dim)
                 if j <= i then
+                    local scaled_dscore = dscores[j-1] / math.sqrt(head_dim)
                     for d = 0, head_dim-1 do
-                      local scaled_dscore = dscores[j-1] / math.sqrt(head_dim)
-                      dq[d] = dq[d] + head_cache.keys[j][d] * scaled_dscore
-                      dkeys[j][d] = head_cache.q[d] * scaled_dscore
+                        dq[d] = dq[d] + head_cache.keys[j][d] * scaled_dscore
+                        dkeys[j][d] = head_cache.q[d] * scaled_dscore
                     end
+
+                    -- Backprop through relative position bias
+                    if cfg.relative_pos_bias then
+                        local relative_pos = i - j
+                        local bucket = relative_position_bucket(relative_pos, false, cfg.num_relative_pos_buckets, cfg.max_distance)
+                        grad_relative_pos_bias[bucket-1] = grad_relative_pos_bias[bucket-1] + dscores[j-1]
+                    end
+
                 else
-                  for d = 0, head_dim-1 do
-                    dkeys[j][d] = 0 -- masked
-                  end
+                    for d = 0, head_dim-1 do
+                        dkeys[j][d] = 0 -- masked
+                    end
                 end
             end
 
@@ -862,17 +949,17 @@ local dres1 = {}
             for d = 1, head_dim do
                 for r = 1, cfg.embed_dim do
                     local q_grad = dq[d-1]
-                  block.attn.q:add_grad(r, (h-1)*head_dim + d, norm_cache[i].vec[r-1] * q_grad)
-                  grad_q_bias[d-1] = grad_q_bias[d-1] + q_grad
-                  for j = 1, seq_len do
+                    block.attn.q:add_grad(r, (h-1)*head_dim + d, norm_cache[i].vec[r-1] * q_grad)
+                    grad_q_bias[d-1] = grad_q_bias[d-1] + q_grad
+                    for j = 1, seq_len do
                         local k_grad = dkeys[j][d-1]
                         block.attn.k:add_grad(r, (h-1)*head_dim + d, norm_cache[j].vec[r-1] * k_grad)
-                    grad_k_bias[d-1] = grad_k_bias[d-1] + k_grad  -- Accumulate bias gradient
+                        grad_k_bias[d-1] = grad_k_bias[d-1] + k_grad  -- Accumulate bias gradient
 
                         local v_grad = dvalues[j][d-1]
                         block.attn.v:add_grad(r, (h-1)*head_dim + d, norm_cache[j].vec[r-1] * v_grad)
-                    grad_v_bias[d-1] = grad_v_bias[d-1] + v_grad
-                  end
+                        grad_v_bias[d-1] = grad_v_bias[d-1] + v_grad
+                    end
                 end
             end
 
@@ -883,24 +970,30 @@ local dres1 = {}
                 block.attn.v_bias:add_grad((h-1)*head_dim + d, grad_v_bias[d-1])
             end
 
+            -- Update relative position bias
+            if cfg.relative_pos_bias then
+                for bucket = 1, cfg.num_relative_pos_buckets do
+                    GPT.relative_pos_bias:add_grad(bucket, h, grad_relative_pos_bias[bucket-1])
+                end
+            end
 
             -- Accumulate gradients for the normalized input
             for r = 0, cfg.embed_dim-1 do
-              local dnorm_idx = (i - 1) * cfg.embed_dim + r
-              for d = 1, head_dim do
-                  local q_grad = dq[d - 1]
-                  dnorm[dnorm_idx] = dnorm[dnorm_idx] + block.attn.q:get(r + 1, (h - 1) * head_dim + d) * q_grad
+                local dnorm_idx = (i - 1) * cfg.embed_dim + r
+                for d = 1, head_dim do
+                    local q_grad = dq[d - 1]
+                    dnorm[dnorm_idx] = dnorm[dnorm_idx] + block.attn.q:get(r + 1, (h - 1) * head_dim + d) * q_grad
 
-                  for j = 1, seq_len do
-                      local k_grad = dkeys[j][d - 1]
-                      local dnorm_j_idx = (j - 1) * cfg.embed_dim + r
-                      dnorm[dnorm_j_idx] = dnorm[dnorm_j_idx] + block.attn.k:get(r + 1, (h - 1) * head_dim + d) * k_grad
+                    for j = 1, seq_len do
+                        local k_grad = dkeys[j][d - 1]
+                        local dnorm_j_idx = (j - 1) * cfg.embed_dim + r
+                        dnorm[dnorm_j_idx] = dnorm[dnorm_j_idx] + block.attn.k:get(r + 1, (h - 1) * head_dim + d) * k_grad
 
-                      local v_grad = dvalues[j][d - 1]
-                      dnorm[dnorm_j_idx] = dnorm[dnorm_j_idx] + block.attn.v:get(r + 1, (h - 1) * head_dim + d) * v_grad
-                  end
-              end
-          end
+                        local v_grad = dvalues[j][d - 1]
+                        dnorm[dnorm_j_idx] = dnorm[dnorm_j_idx] + block.attn.v:get(r + 1, (h - 1) * head_dim + d) * v_grad
+                    end
+                end
+            end
         end
     end
 
@@ -934,26 +1027,27 @@ local function backward(dlogits, caches, activations)
     for layer = cfg.num_layers, 1, -1 do
         local dblock_out_all_b = {}
         for b = 1, batch_size do
-          dblock_out_all_b[b] = {}
-          for t = 1, seq_len do
-            dblock_out_all_b[b][t] = activations[layer+1][b][t].ddata
-          end
+            dblock_out_all_b[b] = {}
+            for t = 1, seq_len do
+                dblock_out_all_b[b][t] = activations[layer+1][b][t].ddata
+            end
         end
 
         for b = 1, batch_size do
-          local dblock_in = backward_transformer_block(
+            local dblock_in = backward_transformer_block(
                 GPT.blocks[layer],
                 caches.transformer[layer].block,
                 dblock_out_all_b[b],
-                caches.transformer[layer].norm
+                caches.transformer[layer].norm,
+                GPT.relative_pos_bias
             )
-          for t=1, seq_len do
-            activations[layer][b][t].ddata = dblock_in[t] -- update gradient
-          end
+            for t=1, seq_len do
+                activations[layer][b][t].ddata = dblock_in[t] -- update gradient
+            end
         end
     end
 
-     -- Backprop through embeddings
+    -- Backprop through embeddings
     for b = 1, batch_size do
         for t = 1, seq_len do
             local token_id = caches.embeddings[b][t].input_token
@@ -999,7 +1093,7 @@ local function softmax(logits)
             end
 
             dlogits[b][t] = ffi.new("double[?]", cfg.vocab_size + 1)
-             ffi.fill(dlogits[b][t], ffi.sizeof("double") * (cfg.vocab_size + 1), 0)
+            ffi.fill(dlogits[b][t], ffi.sizeof("double") * (cfg.vocab_size + 1), 0)
 
         end
     end
@@ -1017,15 +1111,15 @@ local function cross_entropy_loss(probs, targets)
     local dlogits = {}
 
     for b = 1, batch_size do
-      dlogits[b] = {}
+        dlogits[b] = {}
         for t = 1, seq_len-1 do -- Iterate only up to seq_len-1
             local target_idx = targets[b][t+1] -- Corrected target indexing
             local prob = probs[b][t][target_idx-1]
 
             if prob > 0 then
-              loss = loss - math.log(prob)
+                loss = loss - math.log(prob)
             else
-              loss = loss - math.log(1e-15) -- Clip for numerical stability
+                loss = loss - math.log(1e-15) -- Clip for numerical stability
             end
 
             count = count + 1
@@ -1039,13 +1133,14 @@ local function cross_entropy_loss(probs, targets)
 end
 
 --------------------------------------------------
--- Adam Optimizer Update
+-- AdamW Optimizer Update with Learning Rate Schedule
 --------------------------------------------------
-local function adam_update(tensor, step)
+local function adamw_update(tensor, step, total_steps)
     local beta1 = cfg.beta1
     local beta2 = cfg.beta2
     local eps = cfg.eps
     local lr = cfg.lr
+    local weight_decay = cfg.weight_decay
 
     local size
     if tensor.rows then
@@ -1053,7 +1148,19 @@ local function adam_update(tensor, step)
     elseif tensor.size then
         size = tensor.size
     else
-       error("Invalid tensor structure for Adam update.")
+        error("Invalid tensor structure for AdamW update.")
+    end
+
+    -- Linear Warmup and Decay Schedule
+    if cfg.learning_rate_decay then
+        if step < cfg.warmup_steps then
+            lr = lr * (step / cfg.warmup_steps) -- Warmup
+        else
+            local decay_steps = total_steps - cfg.warmup_steps
+            local current_decay_step = step - cfg.warmup_steps
+            local decay_ratio = math.max(0, (1 - current_decay_step / decay_steps))
+            lr = lr * (cfg.final_learning_rate_ratio + (1 - cfg.final_learning_rate_ratio) * decay_ratio)
+        end
     end
 
     for i = 0, size - 1 do
@@ -1077,36 +1184,46 @@ local function adam_update(tensor, step)
         -- Compute bias-corrected second raw moment estimate
         local v_hat = tensor.v[i] / (1 - beta2^step)
 
+        -- Apply weight decay (L2 regularization)
+        if tensor.rows or tensor.size then -- Apply only to weights and biases
+            tensor.data[i] = tensor.data[i] - lr * weight_decay * tensor.data[i]
+        end
+
         -- Update parameters
         local update = lr * m_hat / (math.sqrt(v_hat) + eps)
 
-      if tensor.rows then -- matrix
-          tensor.data[i] = tensor.data[i] - update
-      elseif tensor.size then -- bias
-          tensor.data[i] = tensor.data[i] - update
-      end
+        if tensor.rows then -- matrix
+            tensor.data[i] = tensor.data[i] - update
+        elseif tensor.size then -- bias
+            tensor.data[i] = tensor.data[i] - update
+        end
     end
 end
 
 -- Update all parameters
-local function update_parameters(step)
+local function update_parameters(step, total_steps)
     -- Update embeddings
-    adam_update(GPT.wte, step)
-    adam_update(GPT.wpe, step)
+    adamw_update(GPT.wte, step, total_steps)
+    adamw_update(GPT.wpe, step, total_steps)
 
     -- Update transformer blocks
     for layer = 1, cfg.num_layers do
         for _, component in pairs(GPT.blocks[layer].attn) do
-            adam_update(component, step)
+            adamw_update(component, step, total_steps)
         end
         for _, component in pairs(GPT.blocks[layer].mlp) do
-           adam_update(component, step)
+            adamw_update(component, step, total_steps)
         end
     end
 
     -- Update projection head
-adam_update(GPT.head, step)
-    adam_update(GPT.head_bias, step)
+    adamw_update(GPT.head, step, total_steps)
+    adamw_update(GPT.head_bias, step, total_steps)
+
+    -- Update relative position bias
+    if cfg.relative_pos_bias then
+        adamw_update(GPT.relative_pos_bias, step, total_steps)
+    end
 end
 
 --------------------------------------------------
@@ -1127,10 +1244,12 @@ local function zero_gradients()
             end
         end
     end
-    GPT.head:zero_grad()        -- Use colon operator here
-    GPT.head_bias:zero_grad() -- Use colon operator here
+    GPT.head:zero_grad()          -- Use colon operator here
+    GPT.head_bias:zero_grad()    -- Use colon operator here
+    if cfg.relative_pos_bias then
+        GPT.relative_pos_bias:zero_grad()
+    end
 end
-
 
 --------------------------------------------------
 -- Byte-Level BPE Tokenizer Training
@@ -1158,17 +1277,17 @@ local function train_bpe(text, num_merges)
 
     -- 3. Calculate byte pair frequencies
     local function get_pair_counts(tokenized)
-      local counts = {}
-      for i = 1, #tokenized - 1 do
-          local pair = tokenized[i] .. " " .. tokenized[i + 1] -- space separates byte ids
-          counts[pair] = (counts[pair] or 0) + 1
-      end
-      return counts
+        local counts = {}
+        for i = 1, #tokenized - 1 do
+            local pair = tokenized[i] .. " " .. tokenized[i + 1] -- space separates byte ids
+            counts[pair] = (counts[pair] or 0) + 1
+        end
+        return counts
     end
 
     -- 4. Merge loop
     for merge_iter = 1, num_merges do
-      local pair_counts = get_pair_counts(tokenized_text)
+        local pair_counts = get_pair_counts(tokenized_text)
         if next(pair_counts) == nil then
             print("No more pairs to merge.")
             break  -- Exit if no pairs are found
@@ -1184,25 +1303,40 @@ local function train_bpe(text, num_merges)
 
         if best_pair == nil then break end -- No pairs to merge.
 
-        local new_word = idx_to_word[tonumber(string.match(best_pair, "^(%d+)"))] .. idx_to_word[tonumber(string.match(best_pair, "%s(%d+)$"))]
+        local first_word_id = tonumber(string.match(best_pair, "^(%d+)"))
+        local second_word_id = tonumber(string.match(best_pair, "%s(%d+)$"))
+
+        -- Check if the IDs are valid indices in idx_to_word
+        if not idx_to_word[first_word_id] or not idx_to_word[second_word_id] then
+            print("Invalid word ID in best_pair: " .. best_pair)
+            break -- Or handle this error more gracefully
+        end
+
+        local new_word = idx_to_word[first_word_id] .. idx_to_word[second_word_id]
         local new_vocab_id = #idx_to_word
+
+        -- Check if new_word exceeds maximum string length
+        if #new_word > 65535 then -- Or your Lua's maximum string length
+            print("Merged word exceeds maximum string length: " .. #new_word)
+            break -- Or handle this error more gracefully
+        end
 
         vocab[new_word] = new_vocab_id
         idx_to_word[new_vocab_id] = new_word
 
-      --Update tokenized_text
-      local new_tokenized_text = {}
+        --Update tokenized_text
+        local new_tokenized_text = {}
         local i = 1
         while i <= #tokenized_text do
             if i < #tokenized_text then
-              local current_pair = tokenized_text[i] .. " " .. tokenized_text[i + 1]
-              if current_pair == best_pair then
-                table.insert(new_tokenized_text, new_vocab_id)
-                i = i + 2
-              else
-                  table.insert(new_tokenized_text, tokenized_text[i])
-                  i = i + 1
-              end
+                local current_pair = tokenized_text[i] .. " " .. tokenized_text[i + 1]
+                if current_pair == best_pair then
+                    table.insert(new_tokenized_text, new_vocab_id)
+                    i = i + 2
+                else
+                    table.insert(new_tokenized_text, tokenized_text[i])
+                    i = i + 1
+                end
             else
                 table.insert(new_tokenized_text, tokenized_text[i])
                 i = i + 1
@@ -1229,13 +1363,13 @@ local function tokenize(text, vocab)
     local tokenized = byte_tokenize(text)
 
     local function merge_tokens(tokenized, vocab)
-      local merged_tokens = {}
+        local merged_tokens = {}
         local i = 1
         while i <= #tokenized do
             if i < #tokenized then
-              local first_word = idx_to_word[tokenized[i]]
-              local second_word = idx_to_word[tokenized[i + 1]]
-              local combined = first_word .. second_word
+                local first_word = idx_to_word[tokenized[i]]
+                local second_word = idx_to_word[tokenized[i + 1]]
+                local combined = first_word .. second_word
                 if vocab[combined] then  -- Check for merged token
                     table.insert(merged_tokens, vocab[combined])
                     i = i + 2
@@ -1248,14 +1382,14 @@ local function tokenize(text, vocab)
                 i = i + 1
             end
         end
-      return merged_tokens
+        return merged_tokens
     end
 
     local merged = merge_tokens(tokenized, vocab)
     -- Repeat merging until no more merges are possible
     while #merged < #tokenized do
-      tokenized = merged
-      merged = merge_tokens(tokenized,vocab)
+        tokenized = merged
+        merged = merge_tokens(tokenized,vocab)
     end
 
     return merged
@@ -1276,11 +1410,10 @@ local function generate(prompt, max_len, temperature)
 
         -- Apply temperature
         if temperature ~= 1.0 then
-          for i = 0, cfg.vocab_size do
-              last_logits[i] = last_logits[i] / temperature
-          end
+            for i = 0, cfg.vocab_size do
+                last_logits[i] = last_logits[i] / temperature
+            end
         end
-
 
         local probs, _ = softmax({{last_logits}})
         local next_token_probs = probs[1][1]
@@ -1290,20 +1423,20 @@ local function generate(prompt, max_len, temperature)
         local cumulative_prob = 0
         local next_token = 0 -- Initialize
         for i = 0, cfg.vocab_size do
-          cumulative_prob = cumulative_prob + next_token_probs[i]
-          if rand_val <= cumulative_prob then
-              next_token = i
-              break
-          end
+            cumulative_prob = cumulative_prob + next_token_probs[i]
+            if rand_val <= cumulative_prob then
+                next_token = i
+                break
+            end
         end
 
         if next_token == 0 then break end  -- EOS
 
-      table.insert(input_seq[1], next_token)
-      if #input_seq[1] > cfg.seq_len then
-        -- Truncate to maintain sequence length.  Remove oldest token.
-        table.remove(input_seq[1], 1)
-      end
+        table.insert(input_seq[1], next_token)
+        if #input_seq[1] > cfg.seq_len then
+            -- Truncate to maintain sequence length.  Remove oldest token.
+            table.remove(input_seq[1], 1)
+        end
     end
 
     -- Convert tokens back to text:
@@ -1363,17 +1496,31 @@ local function init_parameters()
     GPT.head = create_tensor(cfg.embed_dim, cfg.vocab_size + 1)  -- +1 for EOS
     GPT.head_bias = create_bias(cfg.vocab_size + 1) -- and bias
 
-    -- Initialize embedding weights
+    if cfg.relative_pos_bias then
+        GPT.relative_pos_bias = create_relative_position_bias()
+    end
+
+    -- Initialize embedding weights (Normal Distribution)
     local init_range = 0.02
     for i = 1, GPT.wte.rows do
         for j = 1, GPT.wte.cols do
-            GPT.wte:set(i, j, (math.random() - 0.5) * 2 * init_range)
+            GPT.wte:set(i, j, math.randomGaussian() * init_range)
         end
     end
     for i = 1, GPT.wpe.rows do
-      for j = 1, GPT.wpe.cols do
-        GPT.wpe:set(i, j, (math.random() - 0.5) * 2 * init_range)
-      end
+        for j = 1, GPT.wpe.cols do
+            GPT.wpe:set(i, j, math.randomGaussian() * init_range)
+        end
+    end
+
+    -- Initialize relative position bias
+    if cfg.relative_pos_bias then
+        local init_range_pos = 0.02
+        for i = 1, GPT.relative_pos_bias.num_buckets do
+            for j = 1, GPT.relative_pos_bias.num_heads do
+                GPT.relative_pos_bias:set(i, j, math.randomGaussian() * init_range_pos)
+            end
+        end
     end
 end
 --------------------------------------------------
@@ -1401,7 +1548,16 @@ local function save_model()
         beta2 = cfg.beta2,
         eps = cfg.eps,
         grad_clip = cfg.grad_clip,
-        bpe_merges = cfg.bpe_merges
+        bpe_merges = cfg.bpe_merges,
+        relative_pos_bias = cfg.relative_pos_bias,
+        num_relative_pos_buckets = cfg.num_relative_pos_buckets,
+        max_distance = cfg.max_distance,
+        mixed_precision = cfg.mixed_precision,
+        weight_decay = cfg.weight_decay,
+        warmup_steps = cfg.warmup_steps,
+        learning_rate_decay = cfg.learning_rate_decay,
+        final_learning_rate_ratio = cfg.final_learning_rate_ratio,
+        gradient_accumulation_steps = cfg.gradient_accumulation_steps
     }
 
     for key, value in pairs(config_values) do
@@ -1411,7 +1567,6 @@ local function save_model()
         config_stmt:reset()
     end
     config_stmt:finalize()
-
 
     -- 2. Save Vocabulary
     local vocab_stmt = db:prepare("INSERT OR REPLACE INTO vocab (word, id) VALUES (?, ?)")
@@ -1550,13 +1705,29 @@ local function save_model()
     end
     head_stmt:finalize()
 
+    -- 6. Save Relative Position Bias
+    if cfg.relative_pos_bias then
+        local relative_pos_stmt = db:prepare("INSERT OR REPLACE INTO relative_pos_bias (bucket, head, value) VALUES (?, ?, ?)")
+        if not relative_pos_stmt then
+            error("Failed to prepare relative position bias statement: " .. db:errmsg())
+        end
+        for bucket = 1, GPT.relative_pos_bias.num_buckets do
+            for head = 1, GPT.relative_pos_bias.num_heads do
+                relative_pos_stmt:bind(1, bucket)
+                relative_pos_stmt:bind(2, head)
+                relative_pos_stmt:bind(3, GPT.relative_pos_bias:get(bucket, head))
+                relative_pos_stmt:step()
+                relative_pos_stmt:reset()
+            end
+        end
+        relative_pos_stmt:finalize()
+    end
+
     -- Commit the transaction
     db:exec("COMMIT;")
 
     print("Model saved to " .. cfg.model_db)
 end
-
-
 
 local function load_model()
     -- Load config
@@ -1564,7 +1735,9 @@ local function load_model()
     while stmt:step() do
         local key = stmt:get_value(0)
         local value = stmt:get_value(1)
-        cfg[key] = value
+        print("Config key:", key, "value:", value, "type:", type(value)) -- Debugging
+        cfg[key] = tonumber(value) -- Ensure value is treated as a number
+        print("cfg[key] after tonumber:", cfg[key], "type:", type(cfg[key])) -- Debugging
     end
     stmt:finalize()
 
@@ -1590,6 +1763,7 @@ local function load_model()
         local pos = embed_stmt:get_value(1)
         local dim = embed_stmt:get_value(2)
         local val = embed_stmt:get_value(3)
+        print("Embedding type:", type, "pos:", pos, "dim:", dim, "val:", val, "type:", type(val)) -- Debugging
         if type == 'wte' then
             GPT.wte:set(pos, dim, val)
         elseif type == 'wpe' then
@@ -1606,6 +1780,7 @@ local function load_model()
         local i = layer_stmt:get_value(2)
         local j = layer_stmt:get_value(3)
         local value = layer_stmt:get_value(4)
+        print("Layer:", layer_num, "comp:", component_name, "i:", i, "j:", j, "val:", value, "type:", type(value)) -- Debugging
 
         -- Handle head and head_bias (layer 0)
         if layer_num == 0 then
@@ -1620,7 +1795,7 @@ local function load_model()
                 GPT.blocks[layer_num] = transformer_block()
             end
             local layer = GPT.blocks[layer_num]
-            
+
             -- Check if component exists in attn or mlp
             if layer.attn[component_name] then
                 layer.attn[component_name]:set(i, j, value)
@@ -1630,6 +1805,20 @@ local function load_model()
         end
     end
     layer_stmt:finalize()
+
+    -- Load relative position bias
+    if cfg.relative_pos_bias then
+        GPT.relative_pos_bias = create_relative_position_bias()
+        local relative_pos_stmt = db:prepare("SELECT bucket, head, value FROM relative_pos_bias")
+        while relative_pos_stmt:step() do
+            local bucket = relative_pos_stmt:get_value(0)
+            local head = relative_pos_stmt:get_value(1)
+            local value = relative_pos_stmt:get_value(2)
+            print("RelPos bucket:", bucket, "head:", head, "val:", value, "type:", type(value)) -- Debugging
+            GPT.relative_pos_bias:set(bucket, head, value)
+        end
+        relative_pos_stmt:finalize()
+    end
 
     print("Model loaded from " .. cfg.model_db)
 end
@@ -1641,7 +1830,7 @@ end
 local function main()
     local data_file = "input.txt"  -- Or any other text file
     if #arg > 0 then
-      data_file = arg[1]
+        data_file = arg[1]
     end
     local text = load_data(data_file)
     print("Data loaded. Length: " .. #text)
@@ -1649,15 +1838,15 @@ local function main()
     -- Try loading existing model, otherwise train BPE and initialize
     local model_exists = (db:prepare("SELECT 1 FROM config LIMIT 1"):step() == sqlite3.ROW)
     if model_exists then
-      load_model()
-      print("Loaded existing model.")
+        load_model()
+        print("Loaded existing model.")
     else
-      print("Training BPE tokenizer...")
-      vocab, idx_to_word = train_bpe(text, cfg.bpe_merges)
-      cfg.vocab_size = #idx_to_word
-      print("BPE vocab size: " .. cfg.vocab_size)
-      init_parameters()
-      print("Initialized new model.")
+        print("Training BPE tokenizer...")
+        vocab, idx_to_word = train_bpe(text, cfg.bpe_merges)
+        cfg.vocab_size = #idx_to_word
+        print("BPE vocab size: " .. cfg.vocab_size)
+        init_parameters()
+        print("Initialized new model.")
     end
 
     local tokenized_data = tokenize(text, vocab)
@@ -1665,28 +1854,35 @@ local function main()
 
     print("Starting training...")
     local start_time = os.clock()
+    local total_steps = cfg.max_iters / cfg.gradient_accumulation_steps
 
     for iter = 1, cfg.max_iters do
         local inputs, targets = get_batch(tokenized_data, cfg.batch_size, cfg.seq_len)
-        zero_gradients()
+        if iter % cfg.gradient_accumulation_steps == 1 then
+            zero_gradients() -- Zero gradients only at the beginning of accumulation
+        end
+
         local logits, caches, activations = forward_with_cache(inputs)
         local probs, dlogits_from_softmax = softmax(logits)
         local loss, dlogits_from_loss = cross_entropy_loss(probs, targets)
         backward(dlogits_from_loss, caches, activations)
-        update_parameters(iter)
+
+        if iter % cfg.gradient_accumulation_steps == 0 then
+            update_parameters(iter / cfg.gradient_accumulation_steps, total_steps) -- Update every accumulation steps
+        end
 
         if iter % 10 == 0 then
-          local elapsed_time = os.clock() - start_time
-          print(string.format("Iteration: %d, Loss: %.4f, Time: %.2f s", iter, loss, elapsed_time))
-          start_time = os.clock()
+            local elapsed_time = os.clock() - start_time
+            print(string.format("Iteration: %d, Loss: %.4f, Time: %.2f s", iter, loss, elapsed_time))
+            start_time = os.clock()
         end
 
         if iter % 100 == 0 then
-          save_model()
-          local prompt = "The quick brown"  -- Example prompt
-          local generated = generate(prompt, 50, 0.8) -- Generate 50 tokens with temp 0.7
-          print("Generated text (prompt: '"..prompt.."'):\n".. generated)
-          print("------------------------")
+            save_model()
+            local prompt = "The quick brown"  -- Example prompt
+            local generated = generate(prompt, 50, 0.8) -- Generate 50 tokens with temp 0.8
+            print("Generated text (prompt: '"..prompt.."'):\n".. generated)
+            print("------------------------")
         end
     end
     print("Training complete!")
@@ -1694,4 +1890,11 @@ local function main()
 end
 
 math.randomseed(os.time())
+math.randomGaussian = function()
+    local u1 = math.random()
+    local u2 = math.random()
+    local z0 = math.sqrt(-2.0 * math.log(u1)) * math.cos(2.0 * math.pi * u2)
+    return z0
+end
+
 main()
